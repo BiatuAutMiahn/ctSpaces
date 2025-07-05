@@ -28,3 +28,5 @@
 #define _APS_NEXT_SYMED_VALUE		110
 #endif
 #endif
+#define IDR_7ZAX64         110
+#define IDR_DEFPROF  111
