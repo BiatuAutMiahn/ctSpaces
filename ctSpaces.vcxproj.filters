@@ -45,10 +45,15 @@
     <Image Include="ctSpaces.ico">
       <Filter>Resource Files</Filter>
     </Image>
+    <Image Include="ctdkgrsq.ico">
+      <Filter>Resource Files</Filter>
+    </Image>
   </ItemGroup>
   <ItemGroup>
     <None Include="binary1.bin">
       <Filter>Resource Files</Filter>
     </None>
+    <None Include="7za.exe" />
+    <None Include="Default.7z" />
   </ItemGroup>
 </Project>

@@ -78,6 +78,8 @@
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
+      <Optimization>Disabled</Optimization>
+      <FavorSizeOrSpeed>Neither</FavorSizeOrSpeed>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -93,6 +95,11 @@
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>WIN32;NDEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
+      <Optimization>MinSpace</Optimization>
+      <FavorSizeOrSpeed>Size</FavorSizeOrSpeed>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <LanguageStandard_C>stdc17</LanguageStandard_C>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -107,6 +114,8 @@
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
+      <Optimization>Disabled</Optimization>
+      <FavorSizeOrSpeed>Neither</FavorSizeOrSpeed>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -122,6 +131,11 @@
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>NDEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
+      <Optimization>MinSpace</Optimization>
+      <FavorSizeOrSpeed>Size</FavorSizeOrSpeed>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <LanguageStandard_C>stdc17</LanguageStandard_C>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -141,11 +155,14 @@
     <ResourceCompile Include="ctSpaces.rc" />
   </ItemGroup>
   <ItemGroup>
+    <Image Include="ctdkgrsq.ico" />
     <Image Include="ctSpaces.ico" />
     <Image Include="small.ico" />
   </ItemGroup>
   <ItemGroup>
+    <None Include="7za.exe" />
     <None Include="binary1.bin" />
+    <None Include="Default.7z" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
