@@ -78,7 +78,7 @@ enum class ProfileType{
 };
 
 const std::wstring APP_ALIAS=L"ctSpaces";
-const std::wstring APP_VERSION=L"2.0";
+const std::wstring APP_VERSION=L"2.1";
 const std::wstring APP_TITLE=std::format(L"{} v{}b",APP_ALIAS,APP_VERSION);
 const std::wstring GUI_CLASS_NAME=L"ctSpacesLauncherClass";
 ULONG_PTR g_gdiplusToken;
@@ -101,24 +101,90 @@ IShellLink* shellLink=NULL;
 #define WM_APP_TASK_COMPLETE (WM_APP + 1)
 
 const std::vector<std::wstring> aKeepDefault={
-    L"Local State", L"Last Version", L"Last Browser", L"FirstLaunchAfterInstallation", L"First Run", L"ctSpaces",
-    L"DevToolsActivePort", L"Default\\Shortcuts", L"Default\\Shortcuts-journal", L"Default\\Secure Preferences",
-    L"Default\\Preferences", L"Default\\Favicons-journal", L"Default\\Favicons", L"Default\\Bookmarks",
-    L"Default\\Extension State", L"Default\\Extensions", L"Default\\Local Extension Settings"
+    L"Local State",
+    L"Last Version",
+    L"Last Browser",
+    L"FirstLaunchAfterInstallation",
+    L"First Run",
+    L"ctSpaces",
+    L"DevToolsActivePort",
+    L"Default\\Shortcuts",
+    L"Default\\Shortcuts-journal", L"Default\\Secure Preferences",
+    L"Default\\Preferences",
+    L"Default\\Favicons-journal",
+    L"Default\\Favicons",
+    L"Default\\Bookmarks",
+    L"Default\\Extension State",
+    L"Default\\Extensions",
+    L"Default\\Local Extension Settings",
+    L"Default\\Asset Store",
+    L"Default\\Extension Rules",
+    L"Default\\Extension Scripts"
 };
 const std::vector<std::wstring> aKeepActive={
-    L"client.ico", L"client.png", L"ctSpaces", L"Local State", L"Last Version", L"Last Browser",
-    L"FirstLaunchAfterInstallation", L"First Run", L"DevToolsActivePort", L"Default\\History", L"Default\\Shortcuts",
-    L"Default\\Shortcuts-journal", L"Default\\Secure Preferences", L"Default\\Preferences", L"Default\\Favicons-journal",
-    L"Default\\Favicons", L"Default\\Bookmarks", L"Default\\Extension State", L"Default\\Extensions",
-    L"Default\\Local Extension Settings", L"CertificateRevocation", L"AutoLaunchProtocolsComponent", L"Default\\History",
-    L"Default\\Web Data", L"Default\\Web Data-journal", L"Default\\Login Data", L"Default\\Login Data-journal",
-    L"Default\\Favicons", L"Default\\Favicons-journal", L"Default\\MediaDeviceSalts", L"Default\\MediaDeviceSalts-journal",
-    L"Default\\CdmStorage.db", L"Default\\CdmStorage.db-journal", L"Default\\DIPS", L"Default\\DIPS-journal",
-    L"Default\\Local Storage", L"Default\\WebStorage", L"Default\\Service Worker\\Database",
-    L"Default\\ClientCertificates", L"Default\\blob_storage", L"Default\\Session Storage", L"Default\\IndexedDB",
-    L"Default\\Network", L"Default\\Sessions"
+    L"client.ico",
+    L"client.png",
+    L"ctSpaces",
+    L"Local State",
+    L"Last Version",
+    L"Last Browser",
+    L"FirstLaunchAfterInstallation",
+    L"First Run",
+    L"DevToolsActivePort",
+    L"Default\\History",
+    L"Default\\Shortcuts",
+    L"Default\\Shortcuts-journal",
+    L"Default\\Secure Preferences",
+    L"Default\\Preferences",
+    L"Default\\Favicons-journal",
+    L"Default\\Favicons",
+    L"Default\\Bookmarks",
+    L"Default\\Extension State",
+    L"Default\\Extension Rules",
+    L"Default\\Extension Scripts",
+    L"Default\\Extensions",
+    L"Default\\Asset Store",
+    L"Default\\Local Extension Settings",
+    L"CertificateRevocation",
+    L"AutoLaunchProtocolsComponent",
+    L"Default\\History",
+    L"Default\\Web Data",
+    L"Default\\Web Data-journal",
+    L"Default\\Login Data",
+    L"Default\\Login Data-journal",
+    L"Default\\Favicons",
+    L"Default\\Favicons-journal",
+    L"Default\\MediaDeviceSalts",
+    L"Default\\MediaDeviceSalts-journal",
+    L"Default\\CdmStorage.db",
+    L"Default\\CdmStorage.db-journal",
+    L"Default\\DIPS",
+    L"Default\\DIPS-journal",
+    L"Default\\Local Storage",
+    L"Default\\WebStorage",
+    //L"Default\\Service Worker\\Database",
+    L"Default\\ClientCertificates",
+    L"Default\\blob_storage",
+    L"Default\\Session Storage",
+    L"Default\\IndexedDB",
+    L"Default\\Network",
+    L"Default\\Sessions"
 };
+/*
+PKIMetadata\
+WebAssistDataBase
+Web Data
+Web Data-journal
+Prefrences
+Login Data
+Login Data-journal
+History
+History-journal
+Sessions\
+Network\
+Asset Store\
+
+*/
 std::map<std::wstring,DWORD> g_activeProfiles;
 std::vector<IconButtonInfo> g_iconButtons;
 std::vector<std::jthread> g_reaperThreads;
