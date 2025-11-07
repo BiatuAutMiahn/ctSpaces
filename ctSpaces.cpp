@@ -1,6 +1,6 @@
 // ctSpaces.cpp
 
-// Because I didn't have the paitence to port this from the ground up, I used Gemini 2.5 Pro for heavylifting, and filled in the gaps.
+// Because I didn't have the paitence to port this from the ground up, I used Gemini 2.5 Pro for heavylifting and filled in the gaps.
 
 #pragma comment(linker,"/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #pragma comment(lib, "dwmapi.lib")
@@ -78,7 +78,7 @@ enum class ProfileType{
 };
 
 const std::wstring APP_ALIAS=L"ctSpaces";
-const std::wstring APP_VERSION=L"2.1";
+const std::wstring APP_VERSION=L"2.2";
 const std::wstring APP_TITLE=std::format(L"{} v{}b",APP_ALIAS,APP_VERSION);
 const std::wstring GUI_CLASS_NAME=L"ctSpacesLauncherClass";
 ULONG_PTR g_gdiplusToken;
@@ -225,7 +225,12 @@ void TerminateAllProfiles();
 std::wstring GetExeVersion(const fs::path& filePath);
 bool chkUpdate();
 bool doInstall();
-
+HWND CreateToolTip(HWND toolHWND, HWND hDlg, PTSTR pszText);
+static void PostTaskComplete(const std::wstring& name);
+static void LaunchProfileAsync(const std::wstring& name, bool isTemp, bool isDefault);
+void GuiProfDel();
+inline void EnsureMouseVisible();
+inline void FocusClientEdit();
 
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,_In_opt_ HINSTANCE,_In_ LPWSTR lpCmdLine,_In_ int nCmdShow){
     CoInitializeEx(NULL,COINIT_APARTMENTTHREADED|COINIT_DISABLE_OLE1DDE);
@@ -296,11 +301,12 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,_In_opt_ HINSTANCE,_In_ LPWSTR lp
     InitCommonControlsEx(&icex);
     bool useTrdLayout=(wcsstr(lpCmdLine,L"~!Trd:P")!=nullptr);
     g_iconButtons={
-        { 200, NULL, L"I", L"Set Profile Icon", GuiSetIcon },
-        { 201, NULL, L"R", L"Reset Selected Profile to Default (...)", GuiProfReset },
-        { 202, NULL, L"U", L"Update Selected Profile with Default (...)", GuiProfUpd },
-        { 203, NULL, L"D", L"Open Default Profile", GuiOpenDef },
-        { 204, NULL, L"T", L"Launch temporary profile", GuiOpenTmp },
+        { 200, NULL, L"Ico", L"Set Profile Icon", GuiSetIcon },
+        { 201, NULL, L"Rst", L"Reset Selected Profile to Default", GuiProfReset },
+        { 202, NULL, L"Upd", L"Update Selected Profile with Default (Overwrites Profile /w Default)", GuiProfUpd },
+        { 203, NULL, L"Def", L"Modify Default Profile", GuiOpenDef },
+        { 204, NULL, L"Tmp", L"Launch temporary profile", GuiOpenTmp },
+        { 205, NULL, L"Del", L"Delete Profile", GuiProfDel },
     };
     if(useTrdLayout){
         std::vector<IconButtonInfo> trdLayoutButtons={
@@ -308,7 +314,8 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,_In_opt_ HINSTANCE,_In_ LPWSTR lp
             g_iconButtons[4],
             g_iconButtons[2],
             g_iconButtons[1],
-            g_iconButtons[3]
+            g_iconButtons[3],
+            g_iconButtons[5]
         };
         g_iconButtons.swap(trdLayoutButtons);
     }
@@ -317,13 +324,35 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,_In_opt_ HINSTANCE,_In_ LPWSTR lp
     if(!InitInstance(hInstance,nCmdShow)){
         return FALSE;
     }
+
     MSG msg;
-    while(GetMessage(&msg,nullptr,0,0)){
-        if(!IsDialogMessage(g_hGui,&msg)){
+    while (GetMessage(&msg, nullptr, 0, 0)) {
+        // intercept Enter when focus is in the combo or its edit
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_RETURN) {
+            HWND hFocus = GetFocus();
+            if (hFocus == g_hComboClient ||
+                (hFocus && GetParent(hFocus) == g_hComboClient)) {
+                // pretend the Go button was pressed
+                SendMessage(g_hGui,
+                    WM_COMMAND,
+                    MAKELONG(IDOK, BN_CLICKED),
+                    (LPARAM)g_hBtnGo);
+                // don't let the dialog logic eat this
+                continue;
+            }
+        }
+
+        if (!IsDialogMessage(g_hGui, &msg)) {
             TranslateMessage(&msg);
             DispatchMessage(&msg);
         }
     }
+    //while(GetMessage(&msg,nullptr,0,0)){
+    //    if(!IsDialogMessage(g_hGui,&msg)){
+    //        TranslateMessage(&msg);
+    //        DispatchMessage(&msg);
+    //    }
+    //}
     Gdiplus::GdiplusShutdown(g_gdiplusToken);
     CoUninitialize();
     return (int)msg.wParam;
@@ -344,7 +373,7 @@ ATOM MyRegisterClass(HINSTANCE hInstance){
 
 BOOL InitInstance(HINSTANCE hInstance,int nCmdShow){
     g_hInst=hInstance;
-    const int iGuiW=256+64;
+    const int iGuiW=256+64+16+8;
     const int iGuiH=128+4;
     const int iGuiM=4;
     const int iGuiCtrlW=(iGuiW-iGuiM*2);
@@ -370,19 +399,14 @@ BOOL InitInstance(HINSTANCE hInstance,int nCmdShow){
     tic.lpszText=LPSTR_TEXTCALLBACK;
     SendMessage(g_hValidationTooltip,TTM_ADDTOOL,0,(LPARAM)&tic);
     g_hBtnGo=CreateWindowW(L"BUTTON",L"Go",WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON,(iGuiCtrlW/2)-32-4,(25*2)+iGuiM,64,33,g_hGui,(HMENU)IDOK,hInstance,nullptr);
-    HWND hToolTip=CreateWindowEx(0,TOOLTIPS_CLASS,NULL,TTS_ALWAYSTIP|TTS_NOPREFIX,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,g_hGui,NULL,g_hInst,NULL);
-    const int iBtnS=18,iBtnM=2;
-    int iBtnL=iGuiCtrlW-iGuiM*2-((iBtnS+iBtnM)*(static_cast<int>(g_iconButtons.size())+1));
-    int iBtnT=iGuiH-iBtnM-iBtnS-32-8;
-    for(size_t i=0; i<g_iconButtons.size(); ++i){
-        int xPos=iBtnL+((iBtnS+iBtnM)*(static_cast<int>(i)+1));
-        g_iconButtons[i].hWnd=CreateWindowW(L"BUTTON",g_iconButtons[i].symbol.c_str(),WS_CHILD|WS_VISIBLE,xPos,iBtnT,iBtnS,iBtnS,g_hGui,(HMENU)(INT_PTR)g_iconButtons[i].id,g_hInst,nullptr);
-        TOOLINFOW ti={sizeof(TOOLINFOW)};
-        ti.uFlags=TTF_SUBCLASS;
-        ti.hwnd=g_iconButtons[i].hWnd;
-        ti.hinst=g_hInst;
-        ti.lpszText=(LPWSTR)g_iconButtons[i].tooltip.c_str();
-        SendMessage(hToolTip,TTM_ADDTOOL,0,(LPARAM)&ti);
+    //HWND hToolTip=CreateWindowEx(0,TOOLTIPS_CLASS,NULL,TTS_ALWAYSTIP|TTS_NOPREFIX,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,g_hGui,NULL,g_hInst,NULL);
+    const int iBtnS=20,iBtnM=2;
+    int iBtnL=iGuiCtrlW-iGuiM*2-((iBtnS+iBtnM)*(static_cast<int>(g_iconButtons.size())+1))-8;
+    for (size_t ix=0; ix<g_iconButtons.size(); ++ix) {
+        int iBtnT=iGuiH-((iBtnS+iBtnM)*(2-((ix/4)%((g_iconButtons.size()/4)*4))))-32-6;
+        int xPos=iBtnL+((iBtnS+iBtnM+10)*(static_cast<int>(ix%4)+1));
+        g_iconButtons[ix].hWnd=CreateWindowW(L"BUTTON",g_iconButtons[ix].symbol.c_str(),WS_CHILD|WS_VISIBLE,xPos,iBtnT,iBtnS+10,iBtnS,g_hGui,(HMENU)(INT_PTR)g_iconButtons[ix].id,g_hInst,nullptr);
+        CreateToolTip(g_iconButtons[ix].hWnd,g_hGui,(LPWSTR)g_iconButtons[ix].tooltip.c_str());
     }
     EnumChildWindows(g_hGui,[](HWND hwnd,LPARAM lParam)->BOOL{SendMessage(hwnd,WM_SETFONT,(WPARAM)lParam,TRUE);return TRUE;},(LPARAM)g_hFont);
     UpdateClientsComboBox();
@@ -434,6 +458,7 @@ LRESULT CALLBACK WndProc(HWND hWnd,UINT message,WPARAM wParam,LPARAM lParam){
                     GetWindowRect(g_hComboClient,&rect);
                     SendMessage(g_hValidationTooltip,TTM_TRACKPOSITION,0,MAKELPARAM(rect.left+4,rect.bottom-4));
                     SendMessage(g_hValidationTooltip,TTM_TRACKACTIVATE,TRUE,(LPARAM)&ti);
+                    SendMessage(g_hComboClient,CB_SHOWDROPDOWN,FALSE,0);
                 } else{
                     g_sLastValidComboText=currentText;
                     TOOLINFOW ti={sizeof(TOOLINFOW)};
@@ -441,14 +466,40 @@ LRESULT CALLBACK WndProc(HWND hWnd,UINT message,WPARAM wParam,LPARAM lParam){
                     ti.uId=(UINT_PTR)g_hComboClient;
                     SendMessage(g_hValidationTooltip,TTM_TRACKACTIVATE,FALSE,(LPARAM)&ti);
                     if(currentText.length()>0){
-                        LRESULT matchIndex=SendMessage(g_hComboClient,CB_FINDSTRING,(WPARAM)-1,(LPARAM)currentText.c_str());
-                        if(matchIndex!=CB_ERR){
-                            wchar_t listItem[256];
-                            SendMessage(g_hComboClient,CB_GETLBTEXT,matchIndex,(LPARAM)listItem);
-                            SetWindowText(g_hComboClient,listItem);
-                            SendMessage(g_hComboClient,CB_SETEDITSEL,0,MAKELPARAM(currentText.length(),-1));
+                        int ciMatchIdx = -1;
+                        int csMatchIdx = -1;
+                        wchar_t buf[256];
+                        for(int i=0;i<(int)SendMessage(g_hComboClient,CB_GETCOUNT,0,0);++i){
+                            SendMessage(g_hComboClient,CB_GETLBTEXT,i,(LPARAM)buf);
+                            std::wstring listItem=buf;
+                            if (csMatchIdx==-1&&listItem.size()>=currentText.size()&&listItem.compare(0,currentText.size(),currentText)==0){
+                                csMatchIdx=i;
+                                break;
+                            }
+                            if (ciMatchIdx==-1&&listItem.size()>=currentText.size()&&_wcsnicmp(listItem.c_str(),currentText.c_str(),currentText.size())==0){
+                                ciMatchIdx=i;
+                            }
                         }
+                        if (csMatchIdx!=-1) {
+                            SendMessage(g_hComboClient, CB_GETLBTEXT, csMatchIdx, (LPARAM)buf);
+                            SendMessage(g_hComboClient, CB_SETCURSEL, csMatchIdx, 0);
+                            SendMessage(g_hComboClient, CB_SHOWDROPDOWN, TRUE, 0);
+                            EnsureMouseVisible();
+                            SetWindowText(g_hComboClient, buf);
+                        }else if (ciMatchIdx!=-1) {
+                            SendMessage(g_hComboClient, CB_SETCURSEL, ciMatchIdx, 0);
+                            SendMessage(g_hComboClient, CB_SHOWDROPDOWN, TRUE, 0);
+                            EnsureMouseVisible();
+                            SetWindowText(g_hComboClient, currentText.c_str());
+                        }else{
+                            SendMessage(g_hComboClient,CB_SHOWDROPDOWN,FALSE,0);
+                            SetWindowText(g_hComboClient, currentText.c_str());
+                        }
+                        SendMessage(g_hComboClient, CB_SETEDITSEL, 0, MAKELPARAM((DWORD)currentText.length(), (DWORD)-1));
+                    }else{
+                        SendMessage(g_hComboClient, CB_SHOWDROPDOWN, FALSE, 0);
                     }
+
                 }
             }
         } else if(wmId==IDOK){
@@ -471,21 +522,30 @@ LRESULT CALLBACK WndProc(HWND hWnd,UINT message,WPARAM wParam,LPARAM lParam){
         return (INT_PTR)GetThemeSysColorBrush(NULL,COLOR_BTNFACE);
     }
     case WM_APP_TASK_COMPLETE: {
-        SetUiState(true);
-        wchar_t clientNameBuffer[256];
-        GetWindowText(g_hComboClient,clientNameBuffer,256);
-        std::wstring clientName=SanitizeName(clientNameBuffer);
-        g_sClientSel=clientNameBuffer;
-        UpdateClientsComboBox();
-        LRESULT selectionIndex=SendMessage(g_hComboClient,CB_FINDSTRINGEXACT,(WPARAM)-1,(LPARAM)g_sClientSel.c_str());
-        if(selectionIndex!=CB_ERR){
-            SendMessage(g_hComboClient,CB_SETCURSEL,(WPARAM)selectionIndex,0);
-        } else{
-            SetWindowText(g_hComboClient,g_sClientSel.c_str());
+        std::wstring clientName;
+        if (lParam) {
+            std::wstring* pName = reinterpret_cast<std::wstring*>(lParam);
+            clientName = *pName;
+            delete pName;
         }
-        SetFocus(g_hComboClient);
-        SendMessage(g_hComboClient,CB_SETEDITSEL,0,MAKELPARAM(0,-1));
-
+        else {
+            wchar_t clientNameBuffer[256];
+            GetWindowText(g_hComboClient, clientNameBuffer, 256);
+            clientName = SanitizeName(clientNameBuffer);
+        }
+        SetUiState(true);
+        
+        if (!clientName.empty()&&clientName!=L"Temp"&&clientName!=L"Default"){
+            g_sClientSel=clientName;
+            UpdateClientsComboBox();
+            LRESULT idx=SendMessage(g_hComboClient,CB_FINDSTRINGEXACT,(WPARAM)-1,(LPARAM)clientName.c_str());
+            if (idx!=CB_ERR){
+                SendMessage(g_hComboClient,CB_SETCURSEL,(WPARAM)idx,0);
+            }else{
+                SetWindowText(g_hComboClient,clientName.c_str());
+            }
+        }
+        FocusClientEdit();
         return 0;
     }
     case WM_CLOSE: {
@@ -517,43 +577,52 @@ LRESULT CALLBACK WndProc(HWND hWnd,UINT message,WPARAM wParam,LPARAM lParam){
         PostQuitMessage(0);
         break;
     }
+    case WM_ACTIVATE: {
+        if (LOWORD(wParam) != WA_INACTIVE) {
+            FocusClientEdit();
+        }
+        return 0;
+    }
+    case WM_SETFOCUS: {
+        FocusClientEdit();
+        return 0;
+    }
     default:
         return DefWindowProc(hWnd,message,wParam,lParam);
     }
     return 0;
 }
-void GuiProfOpen(){
+
+void GuiProfOpen() {
+    SetUiState(false);
     wchar_t clientNameBuffer[256];
-    GetWindowText(g_hComboClient,clientNameBuffer,256);
-    std::wstring clientName=SanitizeName(clientNameBuffer);
-    if(clientName.empty()){
-        MessageBox(g_hGui,L"Please select or enter a valid client name.",L"Input Error",MB_OK|MB_ICONWARNING);
+    GetWindowText(g_hComboClient, clientNameBuffer, 256);
+    std::wstring clientName = SanitizeName(clientNameBuffer);
+    if (clientName.empty()) {
+        MessageBox(g_hGui, L"Please select or enter a valid client name.", L"Input Error", MB_OK | MB_ICONWARNING);
+        SetUiState(true);
         return;
     }
-    std::lock_guard<std::mutex> lock(g_activeProfilesMutex);
-    if(g_activeProfiles.count(clientName)){
-        MessageBox(g_hGui,L"This profile is already open.",L"Already Running",MB_OK|MB_ICONINFORMATION);
-        return;
-    }
-    DWORD pid=LaunchProfile(clientName,false,false);
-    if(pid>0){
-        g_activeProfiles[clientName]=pid;
-        g_reaperThreads.emplace_back(ReaperThread,pid,clientName,ProfileType::Standard);
-        EnsureWatcherIsRunning();
-        UpdateClientsComboBox();
-        LRESULT selectionIndex=SendMessage(g_hComboClient,CB_FINDSTRINGEXACT,(WPARAM)-1,(LPARAM)clientName.c_str());
-        if(selectionIndex!=CB_ERR){
-            SendMessage(g_hComboClient,CB_SETCURSEL,(WPARAM)selectionIndex,0);
+
+    {
+        std::lock_guard<std::mutex> lock(g_activeProfilesMutex);
+        if (g_activeProfiles.count(clientName)) {
+            MessageBox(g_hGui, L"This profile is already open.", L"Already Running", MB_OK | MB_ICONINFORMATION);
+            SetUiState(true);
+            return;
         }
     }
+    LaunchProfileAsync(clientName,false,false);
 }
 
 void GuiSetIcon(){
+    SetUiState(false);
     wchar_t clientNameBuffer[256];
     GetWindowText(g_hComboClient,clientNameBuffer,256);
     std::wstring clientName=SanitizeName(clientNameBuffer);
     if(clientName.empty()){
         MessageBox(g_hGui,L"Please select a client first.",L"Warning",MB_OK|MB_ICONWARNING);
+        SetUiState(true);
         return;
     }
     std::wstring filter;
@@ -622,19 +691,23 @@ void GuiSetIcon(){
             MessageBox(g_hGui,errorMsg.c_str(),L"Error",MB_OK|MB_ICONERROR);
         }
     }
+    SetUiState(true);
 }
 
 void GuiProfReset(){
+    SetUiState(false);
     wchar_t clientNameBuffer[256];
     GetWindowText(g_hComboClient,clientNameBuffer,256);
     std::wstring clientName=SanitizeName(clientNameBuffer);
     if(clientName.empty()){
         MessageBox(g_hGui,L"Please select a client first.",L"Warning",MB_OK|MB_ICONWARNING);
+        SetUiState(true);
         return;
     }
     std::lock_guard<std::mutex> lock(g_activeProfilesMutex);
     if(g_activeProfiles.count(clientName)){
         MessageBox(g_hGui,L"Cannot reset a profile that is currently active.",L"Action Denied",MB_OK|MB_ICONWARNING);
+        SetUiState(true);
         return;
     }
     if(MessageBox(g_hGui,L"This will completely delete and reset the profile. Are you sure?",L"Confirm Reset",MB_YESNO|MB_ICONQUESTION)==IDYES){
@@ -651,25 +724,27 @@ void GuiProfReset(){
         if(selectionIndex!=CB_ERR){
             SendMessage(g_hComboClient,CB_SETCURSEL,(WPARAM)selectionIndex,0);
         }
-
     }
+    SetUiState(true);
 }
 
 void GuiProfUpd(){
+    SetUiState(false);
     wchar_t clientNameBuffer[256];
     GetWindowText(g_hComboClient,clientNameBuffer,256);
     std::wstring clientName=SanitizeName(clientNameBuffer);
     if(clientName.empty()){
         MessageBox(g_hGui,L"Please select a client first.",L"Warning",MB_OK|MB_ICONWARNING);
+        SetUiState(true);
         return;
     }
     std::lock_guard<std::mutex> lock(g_activeProfilesMutex);
     if(g_activeProfiles.count(clientName)){
         MessageBox(g_hGui,L"Cannot update a profile that is currently active.",L"Action Denied",MB_OK|MB_ICONWARNING);
+        SetUiState(true);
         return;
     }
     if(MessageBox(g_hGui,L"This will update/overwrite the profile. Are you sure?",L"Confirm Reset",MB_YESNO|MB_ICONQUESTION)==IDYES){
-        SetUiState(false);
         std::thread([clientName](){
             fs::path sData=g_sDataDir/"Sites"/clientName;
             try{
@@ -682,32 +757,27 @@ void GuiProfUpd(){
                     }).detach();
     }
 }
+
 void GuiOpenDef(){
+    SetUiState(false);
     std::lock_guard<std::mutex> lock(g_activeProfilesMutex);
     if(g_activeProfiles.count(L"Default")){
         MessageBox(g_hGui,L"The Default profile is already open.",L"Already Running",MB_OK|MB_ICONINFORMATION);
+        SetUiState(true);
         return;
     }
-    DWORD pid=LaunchProfile(L"Default",false,true);
-    if(pid>0){
-        g_activeProfiles[L"Default"]=pid;
-        g_reaperThreads.emplace_back(ReaperThread,pid,L"Default",ProfileType::Default);
-        EnsureWatcherIsRunning();
-    }
+    LaunchProfileAsync(L"Default", false, true);
 }
 
 void GuiOpenTmp(){
+    SetUiState(false);
     std::lock_guard<std::mutex> lock(g_activeProfilesMutex);
     if(g_activeProfiles.count(L"Temp")){
         MessageBox(g_hGui,L"A temporary profile is already open.",L"Already Running",MB_OK|MB_ICONINFORMATION);
+        SetUiState(true);
         return;
     }
-    DWORD pid=LaunchProfile(L"Temp",true,false);
-    if(pid>0){
-        g_activeProfiles[L"Temp"]=pid;
-        g_reaperThreads.emplace_back(ReaperThread,pid,L"Temp",ProfileType::Temporary);
-        EnsureWatcherIsRunning();
-    }
+    LaunchProfileAsync(L"Temp", true, false);
 }
 struct EnumData{
     DWORD processId;
@@ -799,7 +869,7 @@ bool RunCommand(const std::wstring& command,const fs::path& workingDir){
     STARTUPINFOW si={sizeof(si)};
     PROCESS_INFORMATION pi={};
     si.dwFlags=STARTF_USESHOWWINDOW;
-    si.wShowWindow=SW_SHOW;
+    si.wShowWindow = SW_SHOWDEFAULT;// SW_SHOW;
     if(CreateProcessW(NULL,&fullCmd[0],NULL,NULL,FALSE,0,NULL,workingDir.c_str(),&si,&pi)){
         WaitForSingleObject(pi.hProcess,INFINITE);
         DWORD exitCode;
@@ -817,6 +887,8 @@ void SetUiState(bool enabled){
     for(const auto& btn:g_iconButtons){
         EnableWindow(btn.hWnd,enabled);
     }
+    if (enabled)
+        FocusClientEdit();
 }
 
 bool extDef(const fs::path& profileDataPath){
@@ -1210,6 +1282,7 @@ void ReaperThread(DWORD pid,std::wstring clientName,ProfileType type){
     case ProfileType::Default:
         profilePath=g_sDataDir/"Default";
         CleanupProfile(profilePath,aKeepActive);
+        SetUiState(false);
         if(MessageBox(g_hGui,L"Save changes to default profile?",APP_TITLE.c_str(),MB_YESNO|MB_ICONQUESTION|MB_APPLMODAL)==IDYES){
             fs::path backup7z=g_sDataDir/"Default.7z";
             fs::path bakDir=g_sDataDir/"_DefBak";
@@ -1227,6 +1300,7 @@ void ReaperThread(DWORD pid,std::wstring clientName,ProfileType type){
             std::wstring sevenZipCmd=std::format(L"a -mx=9 \"{}\" \"{}\"",backup7z.c_str(),pathToArchive.c_str());
             RunCommand(sevenZipCmd,g_sDataDir);
         }
+        SetUiState(true);
         try{ fs::remove_all(profilePath); } catch(...){}
         break;
 
@@ -1481,3 +1555,116 @@ bool chkUpdate(){
         }
     }
 }
+
+// Ref: https://learn.microsoft.com/en-us/windows/win32/controls/create-a-tooltip-for-a-control
+HWND CreateToolTip(HWND hwndTool,HWND hDlg,PTSTR pszText){
+    if (!hwndTool||!hDlg||!pszText)
+        return FALSE;
+    HWND hwndTip=CreateWindowEx(NULL,TOOLTIPS_CLASS,NULL,WS_POPUP|TTS_ALWAYSTIP|TTS_BALLOON,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,hDlg,NULL,g_hInst,NULL);
+    if (!hwndTool||!hwndTip)
+        return (HWND)NULL;
+    TOOLINFO toolInfo={0};
+    toolInfo.cbSize=sizeof(toolInfo);
+    toolInfo.hwnd=hDlg;
+    toolInfo.uFlags=TTF_IDISHWND|TTF_SUBCLASS;
+    toolInfo.uId=(UINT_PTR)hwndTool;
+    toolInfo.lpszText=pszText;
+    SendMessage(hwndTip,TTM_ADDTOOL,0,(LPARAM)&toolInfo);
+    return hwndTip;
+}
+
+static void PostTaskComplete(const std::wstring& name) {
+    auto* pName = new std::wstring(name);
+    PostMessage(g_hGui, WM_APP_TASK_COMPLETE, 0, (LPARAM)pName);
+}
+
+static void LaunchProfileAsync(const std::wstring& name, bool isTemp, bool isDefault){
+    SetUiState(false);
+    std::thread([name, isTemp, isDefault]() {
+        DWORD pid = LaunchProfile(name, isTemp, isDefault);
+        if (pid > 0) {
+            {
+                std::lock_guard<std::mutex> lock(g_activeProfilesMutex);
+                g_activeProfiles[name] = pid;
+            }
+            g_reaperThreads.emplace_back(ReaperThread, pid, name,
+                isTemp ? ProfileType::Temporary :
+                (isDefault ? ProfileType::Default : ProfileType::Standard));
+            EnsureWatcherIsRunning();
+        }
+        PostTaskComplete(name);
+        }).detach();
+}
+
+void GuiProfDel() {
+    SetUiState(false);
+    wchar_t clientNameBuffer[256];
+    GetWindowText(g_hComboClient, clientNameBuffer, 256);
+    std::wstring clientName = SanitizeName(clientNameBuffer);
+
+    if (clientName.empty()) {
+        MessageBox(g_hGui, L"Please select a client first.", L"Warning", MB_OK | MB_ICONWARNING);
+        SetUiState(true);
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_activeProfilesMutex);
+    if (g_activeProfiles.count(clientName)) {
+        MessageBox(g_hGui, L"Cannot delete a profile that is currently active.", L"Action Denied", MB_OK | MB_ICONWARNING);
+        SetUiState(true);
+        return;
+    }
+
+    if (MessageBox(g_hGui,
+        L"This will permanently delete the selected profile folder.\n\nContinue?",
+        L"Confirm Delete",
+        MB_YESNO | MB_ICONQUESTION) != IDYES) {
+        SetUiState(true);
+        return;
+    }
+
+    bool hadError = false;
+    std::wstring errMsg;
+
+    fs::path sData = g_sDataDir / L"Sites" / clientName;
+    try {
+        if (fs::exists(sData)) {
+            fs::remove_all(sData);
+        }
+    }
+    catch (const fs::filesystem_error& e) {
+        hadError = true;
+        errMsg = AnsiToWide(e.what());
+    }
+    catch (...) {
+        hadError = true;
+        errMsg = L"Unknown error.";
+    }
+    UpdateClientsComboBox();
+    SetWindowText(g_hComboClient, L"");
+    if (hadError) {
+        std::wstring fullMsg = L"Failed to delete profile.";
+        if (!errMsg.empty()) {
+            fullMsg += L"\n\nDetails: " + errMsg;
+        }
+        MessageBox(g_hGui, fullMsg.c_str(), L"Delete Profile", MB_OK | MB_ICONERROR);
+    } else {
+        MessageBox(g_hGui, L"Profile deleted successfully.", L"Delete Profile", MB_OK | MB_ICONINFORMATION);
+    }
+    SetUiState(true);
+}
+
+inline void EnsureMouseVisible() {
+    CURSORINFO ci{ sizeof(ci) };
+    if (GetCursorInfo(&ci) && ci.flags == 0) {
+        ShowCursor(TRUE);
+    }
+}
+
+inline void FocusClientEdit() {
+    if (g_hComboClient && IsWindowEnabled(g_hComboClient)) {
+        SetFocus(g_hComboClient);
+        SendMessage(g_hComboClient,CB_SETEDITSEL,0,MAKELPARAM(0,-1));
+    }
+}
+
