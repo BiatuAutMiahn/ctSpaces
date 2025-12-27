@@ -22,6 +22,8 @@
 #include <propvarutil.h>
 #include <gdiplus.h>
 #include <shobjidl.h>
+#include "ProgressUI.h"
+#include "InProc7z.h"
 
 #include <memory>
 #include <string>    
@@ -99,6 +101,44 @@ std::map<std::wstring,HICON> g_iconCache;
 std::mutex g_iconCacheMutex;
 IShellLink* shellLink=NULL;
 #define WM_APP_TASK_COMPLETE (WM_APP + 1)
+// ===== InProc7z -> ProgressUI bridge =====
+struct CtSpaces7zUiCtx{
+    HWND mainWnd=nullptr;
+    std::wstring status;
+    int lastPercent=-999;
+    DWORD lastTick=0;
+    bool sentMarquee=false;
+};
+
+static void __stdcall CtSpaces7zProgress(void* user,Ct7zOp op,unsigned int percent,const wchar_t* /*currentItem*/){
+    auto* ctx=reinterpret_cast<CtSpaces7zUiCtx*>(user);
+    if(!ctx||!ctx->mainWnd||!IsWindow(ctx->mainWnd)) return;
+
+    // Unknown progress -> marquee once.
+    if(percent<0){
+        if(!ctx->sentMarquee){
+            ctx->sentMarquee=true;
+            ctx->lastPercent=-1;
+            ctx->lastTick=GetTickCount();
+            ProgressUI_PostUpdate(ctx->mainWnd,ctx->status,-1);
+        }
+        return;
+    }
+
+    if(percent<0) percent=0;
+    if(percent>100) percent=100;
+
+    DWORD now=GetTickCount();
+
+    // Throttle: don't spam the GUI thread.
+    if(percent==ctx->lastPercent&&(now-ctx->lastTick)<150) return;
+    if((now-ctx->lastTick)<33&&percent<100) return; // ~30fps max
+
+    ctx->lastTick=now;
+    ctx->lastPercent=percent;
+    ProgressUI_PostUpdate(ctx->mainWnd,ctx->status,percent);
+}
+
 
 const std::vector<std::wstring> aKeepDefault={
     L"Local State",
@@ -201,8 +241,7 @@ void UpdateClientsComboBox();
 void SetUiState(bool enabled);
 void LaunchAndManageProfile(const std::wstring& clientName,bool isTemp,bool isDefault);
 bool ExtractResourceToFile(UINT resourceID,const fs::path& destPath);
-bool RunCommand(const std::wstring& command,const fs::path& workingDir);
-bool extDef(const fs::path& profileDataPath);
+bool extDef(const fs::path& profileDataPath,const wchar_t* statusText);
 void CleanupProfile(const fs::path& profilePath,const std::vector<std::wstring>& keepList);
 void SetWindowAppId(HWND hWnd,const std::wstring& appId);
 LRESULT CALLBACK WndProc(HWND,UINT,WPARAM,LPARAM);
@@ -225,9 +264,9 @@ void TerminateAllProfiles();
 std::wstring GetExeVersion(const fs::path& filePath);
 bool chkUpdate();
 bool doInstall();
-HWND CreateToolTip(HWND toolHWND, HWND hDlg, PTSTR pszText);
+HWND CreateToolTip(HWND toolHWND,HWND hDlg,PTSTR pszText);
 static void PostTaskComplete(const std::wstring& name);
-static void LaunchProfileAsync(const std::wstring& name, bool isTemp, bool isDefault);
+static void LaunchProfileAsync(const std::wstring& name,bool isTemp,bool isDefault);
 void GuiProfDel();
 inline void EnsureMouseVisible();
 inline void FocusClientEdit();
@@ -295,10 +334,15 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,_In_opt_ HINSTANCE,_In_ LPWSTR lp
         return 1;
     }
     Gdiplus::GdiplusStartup(&g_gdiplusToken,&gdiplusStartupInput,NULL);
-    ExtractResourceToFile(IDR_7ZAX64,g_sDataDir/"7za.exe");
     ExtractResourceToFile(IDR_DEFPROF,g_sDataDir/"Default.7z");
-    INITCOMMONCONTROLSEX icex={sizeof(INITCOMMONCONTROLSEX), ICC_WIN95_CLASSES};
+    INITCOMMONCONTROLSEX icex={sizeof(INITCOMMONCONTROLSEX), ICC_WIN95_CLASSES|ICC_PROGRESS_CLASS};
     InitCommonControlsEx(&icex);
+
+    //InitCommonControlsEx(&icex);
+    ProgressUI_Init(hInstance);
+    Ct7zSetHInstance(hInstance);
+
+
     bool useTrdLayout=(wcsstr(lpCmdLine,L"~!Trd:P")!=nullptr);
     g_iconButtons={
         { 200, NULL, L"Ico", L"Set Profile Icon", GuiSetIcon },
@@ -326,23 +370,23 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,_In_opt_ HINSTANCE,_In_ LPWSTR lp
     }
 
     MSG msg;
-    while (GetMessage(&msg, nullptr, 0, 0)) {
+    while(GetMessage(&msg,nullptr,0,0)){
         // intercept Enter when focus is in the combo or its edit
-        if (msg.message == WM_KEYDOWN && msg.wParam == VK_RETURN) {
-            HWND hFocus = GetFocus();
-            if (hFocus == g_hComboClient ||
-                (hFocus && GetParent(hFocus) == g_hComboClient)) {
+        if(msg.message==WM_KEYDOWN&&msg.wParam==VK_RETURN){
+            HWND hFocus=GetFocus();
+            if(hFocus==g_hComboClient||
+               (hFocus&&GetParent(hFocus)==g_hComboClient)){
                 // pretend the Go button was pressed
                 SendMessage(g_hGui,
-                    WM_COMMAND,
-                    MAKELONG(IDOK, BN_CLICKED),
-                    (LPARAM)g_hBtnGo);
+                            WM_COMMAND,
+                            MAKELONG(IDOK,BN_CLICKED),
+                            (LPARAM)g_hBtnGo);
                 // don't let the dialog logic eat this
                 continue;
             }
         }
 
-        if (!IsDialogMessage(g_hGui, &msg)) {
+        if(!IsDialogMessage(g_hGui,&msg)){
             TranslateMessage(&msg);
             DispatchMessage(&msg);
         }
@@ -402,7 +446,7 @@ BOOL InitInstance(HINSTANCE hInstance,int nCmdShow){
     //HWND hToolTip=CreateWindowEx(0,TOOLTIPS_CLASS,NULL,TTS_ALWAYSTIP|TTS_NOPREFIX,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,g_hGui,NULL,g_hInst,NULL);
     const int iBtnS=20,iBtnM=2;
     int iBtnL=iGuiCtrlW-iGuiM*2-((iBtnS+iBtnM)*(static_cast<int>(g_iconButtons.size())+1))-8;
-    for (size_t ix=0; ix<g_iconButtons.size(); ++ix) {
+    for(size_t ix=0; ix<g_iconButtons.size(); ++ix){
         int iBtnT=iGuiH-((iBtnS+iBtnM)*(2-((ix/4)%((g_iconButtons.size()/4)*4))))-32-6;
         int xPos=iBtnL+((iBtnS+iBtnM+10)*(static_cast<int>(ix%4)+1));
         g_iconButtons[ix].hWnd=CreateWindowW(L"BUTTON",g_iconButtons[ix].symbol.c_str(),WS_CHILD|WS_VISIBLE,xPos,iBtnT,iBtnS+10,iBtnS,g_hGui,(HMENU)(INT_PTR)g_iconButtons[ix].id,g_hInst,nullptr);
@@ -466,38 +510,38 @@ LRESULT CALLBACK WndProc(HWND hWnd,UINT message,WPARAM wParam,LPARAM lParam){
                     ti.uId=(UINT_PTR)g_hComboClient;
                     SendMessage(g_hValidationTooltip,TTM_TRACKACTIVATE,FALSE,(LPARAM)&ti);
                     if(currentText.length()>0){
-                        int ciMatchIdx = -1;
-                        int csMatchIdx = -1;
+                        int ciMatchIdx=-1;
+                        int csMatchIdx=-1;
                         wchar_t buf[256];
                         for(int i=0;i<(int)SendMessage(g_hComboClient,CB_GETCOUNT,0,0);++i){
                             SendMessage(g_hComboClient,CB_GETLBTEXT,i,(LPARAM)buf);
                             std::wstring listItem=buf;
-                            if (csMatchIdx==-1&&listItem.size()>=currentText.size()&&listItem.compare(0,currentText.size(),currentText)==0){
+                            if(csMatchIdx==-1&&listItem.size()>=currentText.size()&&listItem.compare(0,currentText.size(),currentText)==0){
                                 csMatchIdx=i;
                                 break;
                             }
-                            if (ciMatchIdx==-1&&listItem.size()>=currentText.size()&&_wcsnicmp(listItem.c_str(),currentText.c_str(),currentText.size())==0){
+                            if(ciMatchIdx==-1&&listItem.size()>=currentText.size()&&_wcsnicmp(listItem.c_str(),currentText.c_str(),currentText.size())==0){
                                 ciMatchIdx=i;
                             }
                         }
-                        if (csMatchIdx!=-1) {
-                            SendMessage(g_hComboClient, CB_GETLBTEXT, csMatchIdx, (LPARAM)buf);
-                            SendMessage(g_hComboClient, CB_SETCURSEL, csMatchIdx, 0);
-                            SendMessage(g_hComboClient, CB_SHOWDROPDOWN, TRUE, 0);
+                        if(csMatchIdx!=-1){
+                            SendMessage(g_hComboClient,CB_GETLBTEXT,csMatchIdx,(LPARAM)buf);
+                            SendMessage(g_hComboClient,CB_SETCURSEL,csMatchIdx,0);
+                            SendMessage(g_hComboClient,CB_SHOWDROPDOWN,TRUE,0);
                             EnsureMouseVisible();
-                            SetWindowText(g_hComboClient, buf);
-                        }else if (ciMatchIdx!=-1) {
-                            SendMessage(g_hComboClient, CB_SETCURSEL, ciMatchIdx, 0);
-                            SendMessage(g_hComboClient, CB_SHOWDROPDOWN, TRUE, 0);
+                            SetWindowText(g_hComboClient,buf);
+                        } else if(ciMatchIdx!=-1){
+                            SendMessage(g_hComboClient,CB_SETCURSEL,ciMatchIdx,0);
+                            SendMessage(g_hComboClient,CB_SHOWDROPDOWN,TRUE,0);
                             EnsureMouseVisible();
-                            SetWindowText(g_hComboClient, currentText.c_str());
-                        }else{
+                            SetWindowText(g_hComboClient,currentText.c_str());
+                        } else{
                             SendMessage(g_hComboClient,CB_SHOWDROPDOWN,FALSE,0);
-                            SetWindowText(g_hComboClient, currentText.c_str());
+                            SetWindowText(g_hComboClient,currentText.c_str());
                         }
-                        SendMessage(g_hComboClient, CB_SETEDITSEL, 0, MAKELPARAM((DWORD)currentText.length(), (DWORD)-1));
-                    }else{
-                        SendMessage(g_hComboClient, CB_SHOWDROPDOWN, FALSE, 0);
+                        SendMessage(g_hComboClient,CB_SETEDITSEL,0,MAKELPARAM((DWORD)currentText.length(),(DWORD)-1));
+                    } else{
+                        SendMessage(g_hComboClient,CB_SHOWDROPDOWN,FALSE,0);
                     }
 
                 }
@@ -507,7 +551,7 @@ LRESULT CALLBACK WndProc(HWND hWnd,UINT message,WPARAM wParam,LPARAM lParam){
         } else{
             auto it=std::find_if(g_iconButtons.begin(),g_iconButtons.end(),[wmId](const auto& btn){
                 return btn.id==wmId;
-                                 });
+            });
             if(it!=g_iconButtons.end()&&it->handler){
                 it->handler();
             }
@@ -521,27 +565,49 @@ LRESULT CALLBACK WndProc(HWND hWnd,UINT message,WPARAM wParam,LPARAM lParam){
         SetBkColor(hdcControl,GetThemeSysColor(NULL,COLOR_BTNFACE));
         return (INT_PTR)GetThemeSysColorBrush(NULL,COLOR_BTNFACE);
     }
+    case WM_APP_PROGRESS_SHOW: {
+        auto* p=reinterpret_cast<CtProgressPayload*>(lParam);
+        if(p){
+            ProgressUI_Show(g_hGui?g_hGui:hWnd,p->text,p->percent);
+            delete p;
+        }
+        return 0;
+    }
+    case WM_APP_PROGRESS_UPDATE: {
+        auto* p=reinterpret_cast<CtProgressPayload*>(lParam);
+        if(p){
+            if(p->text.empty())
+                ProgressUI_Update(p->percent);
+            else
+                ProgressUI_Update(p->text,p->percent);
+            delete p;
+        }
+        return 0;
+    }
+    case WM_APP_PROGRESS_HIDE: {
+        ProgressUI_Hide();
+        return 0;
+    }
     case WM_APP_TASK_COMPLETE: {
         std::wstring clientName;
-        if (lParam) {
-            std::wstring* pName = reinterpret_cast<std::wstring*>(lParam);
-            clientName = *pName;
+        if(lParam){
+            std::wstring* pName=reinterpret_cast<std::wstring*>(lParam);
+            clientName=*pName;
             delete pName;
-        }
-        else {
+        } else{
             wchar_t clientNameBuffer[256];
-            GetWindowText(g_hComboClient, clientNameBuffer, 256);
-            clientName = SanitizeName(clientNameBuffer);
+            GetWindowText(g_hComboClient,clientNameBuffer,256);
+            clientName=SanitizeName(clientNameBuffer);
         }
         SetUiState(true);
-        
-        if (!clientName.empty()&&clientName!=L"Temp"&&clientName!=L"Default"){
+
+        if(!clientName.empty()&&clientName!=L"Temp"&&clientName!=L"Default"){
             g_sClientSel=clientName;
             UpdateClientsComboBox();
             LRESULT idx=SendMessage(g_hComboClient,CB_FINDSTRINGEXACT,(WPARAM)-1,(LPARAM)clientName.c_str());
-            if (idx!=CB_ERR){
+            if(idx!=CB_ERR){
                 SendMessage(g_hComboClient,CB_SETCURSEL,(WPARAM)idx,0);
-            }else{
+            } else{
                 SetWindowText(g_hComboClient,clientName.c_str());
             }
         }
@@ -578,7 +644,7 @@ LRESULT CALLBACK WndProc(HWND hWnd,UINT message,WPARAM wParam,LPARAM lParam){
         break;
     }
     case WM_ACTIVATE: {
-        if (LOWORD(wParam) != WA_INACTIVE) {
+        if(LOWORD(wParam)!=WA_INACTIVE){
             FocusClientEdit();
         }
         return 0;
@@ -593,21 +659,21 @@ LRESULT CALLBACK WndProc(HWND hWnd,UINT message,WPARAM wParam,LPARAM lParam){
     return 0;
 }
 
-void GuiProfOpen() {
+void GuiProfOpen(){
     SetUiState(false);
     wchar_t clientNameBuffer[256];
-    GetWindowText(g_hComboClient, clientNameBuffer, 256);
-    std::wstring clientName = SanitizeName(clientNameBuffer);
-    if (clientName.empty()) {
-        MessageBox(g_hGui, L"Please select or enter a valid client name.", L"Input Error", MB_OK | MB_ICONWARNING);
+    GetWindowText(g_hComboClient,clientNameBuffer,256);
+    std::wstring clientName=SanitizeName(clientNameBuffer);
+    if(clientName.empty()){
+        MessageBox(g_hGui,L"Please select or enter a valid client name.",L"Input Error",MB_OK|MB_ICONWARNING);
         SetUiState(true);
         return;
     }
 
     {
         std::lock_guard<std::mutex> lock(g_activeProfilesMutex);
-        if (g_activeProfiles.count(clientName)) {
-            MessageBox(g_hGui, L"This profile is already open.", L"Already Running", MB_OK | MB_ICONINFORMATION);
+        if(g_activeProfiles.count(clientName)){
+            MessageBox(g_hGui,L"This profile is already open.",L"Already Running",MB_OK|MB_ICONINFORMATION);
             SetUiState(true);
             return;
         }
@@ -716,7 +782,7 @@ void GuiProfReset(){
             if(fs::exists(sData)){
                 fs::remove_all(sData);
             }
-            extDef(sData);
+            extDef(sData,L"Resetting Profile...");
             MessageBox(g_hGui,L"Profile has been reset.",L"Success",MB_OK|MB_ICONINFORMATION);
         } catch(...){}
         UpdateClientsComboBox();
@@ -751,10 +817,10 @@ void GuiProfUpd(){
                 if(fs::exists(sData)){
                     fs::remove_all(sData);
                 }
-                extDef(sData);
+                extDef(sData,L"Updating Profile...");
             } catch(...){}
             PostMessage(g_hGui,WM_APP_TASK_COMPLETE,0,0);
-                    }).detach();
+        }).detach();
     }
 }
 
@@ -766,7 +832,7 @@ void GuiOpenDef(){
         SetUiState(true);
         return;
     }
-    LaunchProfileAsync(L"Default", false, true);
+    LaunchProfileAsync(L"Default",false,true);
 }
 
 void GuiOpenTmp(){
@@ -777,7 +843,7 @@ void GuiOpenTmp(){
         SetUiState(true);
         return;
     }
-    LaunchProfileAsync(L"Temp", true, false);
+    LaunchProfileAsync(L"Temp",true,false);
 }
 struct EnumData{
     DWORD processId;
@@ -798,7 +864,13 @@ DWORD LaunchProfile(const std::wstring& clientName,bool isTemp,bool isDefault){
     else if(isDefault) profilePath=g_sDataDir/"Default";
     else profilePath=g_sDataDir/"Sites"/clientName;
     if(!fs::exists(profilePath/"ctSpaces")){
-        if(!extDef(profilePath)){
+        const wchar_t* status=
+            isDefault?L"Loading Default Profile...":
+            isTemp?L"Loading Temp Profile...":
+            L"Updating Profile...";
+
+        if(!extDef(profilePath,status)){
+
             MessageBox(NULL,L"Error: An error occurred when extracting the profile.",APP_TITLE.c_str(),MB_OK|MB_ICONERROR);
             return 0;
         }
@@ -863,23 +935,8 @@ bool ExtractResourceToFile(UINT resourceID,const fs::path& destPath){
     return outFile.good();
 }
 
-bool RunCommand(const std::wstring& command,const fs::path& workingDir){
-    fs::path sevenzip=g_sDataDir/L"7za.exe";
-    std::wstring fullCmd=std::format(L"\"{}\" {}",sevenzip.c_str(),command);
-    STARTUPINFOW si={sizeof(si)};
-    PROCESS_INFORMATION pi={};
-    si.dwFlags=STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_SHOWDEFAULT;// SW_SHOW;
-    if(CreateProcessW(NULL,&fullCmd[0],NULL,NULL,FALSE,0,NULL,workingDir.c_str(),&si,&pi)){
-        WaitForSingleObject(pi.hProcess,INFINITE);
-        DWORD exitCode;
-        GetExitCodeProcess(pi.hProcess,&exitCode);
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
-        return exitCode==0;
-    }
-    return false;
-}
+
+
 
 void SetUiState(bool enabled){
     EnableWindow(g_hComboClient,enabled);
@@ -887,20 +944,61 @@ void SetUiState(bool enabled){
     for(const auto& btn:g_iconButtons){
         EnableWindow(btn.hWnd,enabled);
     }
-    if (enabled)
+    if(enabled)
         FocusClientEdit();
 }
 
-bool extDef(const fs::path& profileDataPath){
-    fs::create_directories(profileDataPath);
-    std::wstring cmd=std::format(L"x \"{}\\Default.7z\" -y -o\"{}\"",g_sDataDir.c_str(),profileDataPath.c_str());
-    if(!RunCommand(cmd,g_sDataDir)){
+bool extDef(const fs::path& profileDataPath,const wchar_t* statusText){
+    // Default archive lives in your data dir (still extracted from resource once).
+    const fs::path default7zPath=g_sDataDir/L"Default.7z";
+
+    if(!fs::exists(default7zPath)){
+        if(!ExtractResourceToFile(IDR_DEFPROF,default7zPath)){
+            MessageBoxW(g_hGui,L"Failed to extract Default.7z resource.",L"Error",MB_OK|MB_ICONERROR);
+            return false;
+        }
+    }
+
+    try{
+        fs::create_directories(profileDataPath);
+    } catch(...){
+        // best-effort; Ct7zExtract7z will fail if path can't be created
+    }
+
+    // Always create our marker file on success (your "profile exists" sentinel).
+    const fs::path markerPath=profileDataPath/L"ctSpaces";
+
+    CtSpaces7zUiCtx ctx;
+    ctx.mainWnd=g_hGui;
+    ctx.status=(statusText&&*statusText)?statusText:L"Loading Default Profile...";
+
+    ProgressUI_PostShow(ctx.mainWnd,ctx.status,-1);
+
+    HRESULT hr=Ct7zExtract7z(
+        default7zPath.c_str(),
+        profileDataPath.c_str(),
+        &CtSpaces7zProgress,
+        &ctx
+    );
+
+    ProgressUI_PostHide(ctx.mainWnd);
+
+    if(FAILED(hr)){
+        MessageBoxW(g_hGui,L"Failed to extract Default.7z (InProc7z).",L"Error",MB_OK|MB_ICONERROR);
         return false;
     }
-    std::ofstream marker(profileDataPath/"ctSpaces");
-    marker.close();
+
+    // marker file
+    try{
+        std::wofstream markerFile(markerPath);
+        markerFile.close();
+    } catch(...){
+        // non-fatal
+    }
+
     return true;
 }
+
 
 void SetWindowAppId(HWND hWnd,const std::wstring& appId){
     IPropertyStore* pps;
@@ -1295,10 +1393,31 @@ void ReaperThread(DWORD pid,std::wstring clientName,ProfileType type){
             ss<<std::put_time(&tm_buf,L"%Y.%m.%d,%H%M%S");
             std::wstring timestamp=ss.str();
             std::wstring bakPath=(bakDir/(timestamp+L"-Default.7z")).wstring();
-            try{ fs::rename(backup7z,bakPath); } catch(...){}
-            std::wstring pathToArchive=profilePath.wstring()+L"\\*";
-            std::wstring sevenZipCmd=std::format(L"a -mx=9 \"{}\" \"{}\"",backup7z.c_str(),pathToArchive.c_str());
-            RunCommand(sevenZipCmd,g_sDataDir);
+            try{ fs::rename(backup7z,bakPath); } catch(...){
+                // Keep original behavior (best-effort), but try copy+delete if rename fails (cross-volume, AV locks, etc.).
+                try{ fs::copy_file(backup7z,bakPath,fs::copy_options::overwrite_existing); } catch(...){}
+                try{ fs::remove(backup7z); } catch(...){}
+            }
+            // Rebuild Default.7z from the cleaned Default profile folder (InProc7z).
+            CtSpaces7zUiCtx ctx;
+            ctx.mainWnd=g_hGui;
+            ctx.status=L"Updating Default Profile...";
+
+            ProgressUI_PostShow(ctx.mainWnd,ctx.status,-1);
+
+            HRESULT hr=Ct7zCompress7z(
+                backup7z.c_str(),
+                profilePath.c_str(),
+                false,
+                &CtSpaces7zProgress,
+                &ctx
+            );
+
+            ProgressUI_PostHide(ctx.mainWnd);
+
+            if(FAILED(hr)){
+                MessageBoxW(g_hGui,L"Failed to create Default.7z (InProc7z).",L"Error",MB_OK|MB_ICONERROR);
+            }
         }
         SetUiState(true);
         try{ fs::remove_all(profilePath); } catch(...){}
@@ -1558,10 +1677,10 @@ bool chkUpdate(){
 
 // Ref: https://learn.microsoft.com/en-us/windows/win32/controls/create-a-tooltip-for-a-control
 HWND CreateToolTip(HWND hwndTool,HWND hDlg,PTSTR pszText){
-    if (!hwndTool||!hDlg||!pszText)
+    if(!hwndTool||!hDlg||!pszText)
         return FALSE;
     HWND hwndTip=CreateWindowEx(NULL,TOOLTIPS_CLASS,NULL,WS_POPUP|TTS_ALWAYSTIP|TTS_BALLOON,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,hDlg,NULL,g_hInst,NULL);
-    if (!hwndTool||!hwndTip)
+    if(!hwndTool||!hwndTip)
         return (HWND)NULL;
     TOOLINFO toolInfo={0};
     toolInfo.cbSize=sizeof(toolInfo);
@@ -1573,96 +1692,94 @@ HWND CreateToolTip(HWND hwndTool,HWND hDlg,PTSTR pszText){
     return hwndTip;
 }
 
-static void PostTaskComplete(const std::wstring& name) {
-    auto* pName = new std::wstring(name);
-    PostMessage(g_hGui, WM_APP_TASK_COMPLETE, 0, (LPARAM)pName);
+static void PostTaskComplete(const std::wstring& name){
+    auto* pName=new std::wstring(name);
+    PostMessage(g_hGui,WM_APP_TASK_COMPLETE,0,(LPARAM)pName);
 }
 
-static void LaunchProfileAsync(const std::wstring& name, bool isTemp, bool isDefault){
+static void LaunchProfileAsync(const std::wstring& name,bool isTemp,bool isDefault){
     SetUiState(false);
-    std::thread([name, isTemp, isDefault]() {
-        DWORD pid = LaunchProfile(name, isTemp, isDefault);
-        if (pid > 0) {
+    std::thread([name,isTemp,isDefault](){
+        DWORD pid=LaunchProfile(name,isTemp,isDefault);
+        if(pid>0){
             {
                 std::lock_guard<std::mutex> lock(g_activeProfilesMutex);
-                g_activeProfiles[name] = pid;
+                g_activeProfiles[name]=pid;
             }
-            g_reaperThreads.emplace_back(ReaperThread, pid, name,
-                isTemp ? ProfileType::Temporary :
-                (isDefault ? ProfileType::Default : ProfileType::Standard));
+            g_reaperThreads.emplace_back(ReaperThread,pid,name,
+                                         isTemp?ProfileType::Temporary:
+                                         (isDefault?ProfileType::Default:ProfileType::Standard));
             EnsureWatcherIsRunning();
         }
         PostTaskComplete(name);
-        }).detach();
+    }).detach();
 }
 
-void GuiProfDel() {
+void GuiProfDel(){
     SetUiState(false);
     wchar_t clientNameBuffer[256];
-    GetWindowText(g_hComboClient, clientNameBuffer, 256);
-    std::wstring clientName = SanitizeName(clientNameBuffer);
+    GetWindowText(g_hComboClient,clientNameBuffer,256);
+    std::wstring clientName=SanitizeName(clientNameBuffer);
 
-    if (clientName.empty()) {
-        MessageBox(g_hGui, L"Please select a client first.", L"Warning", MB_OK | MB_ICONWARNING);
+    if(clientName.empty()){
+        MessageBox(g_hGui,L"Please select a client first.",L"Warning",MB_OK|MB_ICONWARNING);
         SetUiState(true);
         return;
     }
 
     std::lock_guard<std::mutex> lock(g_activeProfilesMutex);
-    if (g_activeProfiles.count(clientName)) {
-        MessageBox(g_hGui, L"Cannot delete a profile that is currently active.", L"Action Denied", MB_OK | MB_ICONWARNING);
+    if(g_activeProfiles.count(clientName)){
+        MessageBox(g_hGui,L"Cannot delete a profile that is currently active.",L"Action Denied",MB_OK|MB_ICONWARNING);
         SetUiState(true);
         return;
     }
 
-    if (MessageBox(g_hGui,
-        L"This will permanently delete the selected profile folder.\n\nContinue?",
-        L"Confirm Delete",
-        MB_YESNO | MB_ICONQUESTION) != IDYES) {
+    if(MessageBox(g_hGui,
+                  L"This will permanently delete the selected profile folder.\n\nContinue?",
+                  L"Confirm Delete",
+                  MB_YESNO|MB_ICONQUESTION)!=IDYES){
         SetUiState(true);
         return;
     }
 
-    bool hadError = false;
+    bool hadError=false;
     std::wstring errMsg;
 
-    fs::path sData = g_sDataDir / L"Sites" / clientName;
-    try {
-        if (fs::exists(sData)) {
+    fs::path sData=g_sDataDir/L"Sites"/clientName;
+    try{
+        if(fs::exists(sData)){
             fs::remove_all(sData);
         }
-    }
-    catch (const fs::filesystem_error& e) {
-        hadError = true;
-        errMsg = AnsiToWide(e.what());
-    }
-    catch (...) {
-        hadError = true;
-        errMsg = L"Unknown error.";
+    } catch(const fs::filesystem_error& e){
+        hadError=true;
+        errMsg=AnsiToWide(e.what());
+    } catch(...){
+        hadError=true;
+        errMsg=L"Unknown error.";
     }
     UpdateClientsComboBox();
-    SetWindowText(g_hComboClient, L"");
-    if (hadError) {
-        std::wstring fullMsg = L"Failed to delete profile.";
-        if (!errMsg.empty()) {
-            fullMsg += L"\n\nDetails: " + errMsg;
+    SetWindowText(g_hComboClient,L"");
+    if(hadError){
+        std::wstring fullMsg=L"Failed to delete profile.";
+        if(!errMsg.empty()){
+            fullMsg+=L"\n\nDetails: "+errMsg;
         }
-        MessageBox(g_hGui, fullMsg.c_str(), L"Delete Profile", MB_OK | MB_ICONERROR);
-    } else {
-        MessageBox(g_hGui, L"Profile deleted successfully.", L"Delete Profile", MB_OK | MB_ICONINFORMATION);
+        MessageBox(g_hGui,fullMsg.c_str(),L"Delete Profile",MB_OK|MB_ICONERROR);
+    } else{
+        MessageBox(g_hGui,L"Profile deleted successfully.",L"Delete Profile",MB_OK|MB_ICONINFORMATION);
     }
     SetUiState(true);
 }
 
-inline void EnsureMouseVisible() {
-    CURSORINFO ci{ sizeof(ci) };
-    if (GetCursorInfo(&ci) && ci.flags == 0) {
+inline void EnsureMouseVisible(){
+    CURSORINFO ci{sizeof(ci)};
+    if(GetCursorInfo(&ci)&&ci.flags==0){
         ShowCursor(TRUE);
     }
 }
 
-inline void FocusClientEdit() {
-    if (g_hComboClient && IsWindowEnabled(g_hComboClient)) {
+inline void FocusClientEdit(){
+    if(g_hComboClient&&IsWindowEnabled(g_hComboClient)){
         SetFocus(g_hComboClient);
         SendMessage(g_hComboClient,CB_SETEDITSEL,0,MAKELPARAM(0,-1));
     }

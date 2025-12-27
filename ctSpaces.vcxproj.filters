@@ -27,9 +27,21 @@
     <ClInclude Include="ctSpaces.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="InProc7z.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ProgressUI.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="ctSpaces.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="InProc7z.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="ProgressUI.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
