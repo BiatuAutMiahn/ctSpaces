@@ -54,26 +54,26 @@ using namespace NDir;
 
 
 // ----- ctSpaces progress bridge (thread-local) -----
-static thread_local Ct7zProgressCb g_ct7zProgressCb = nullptr;
-static thread_local void* g_ct7zProgressUser = nullptr;
-static thread_local Ct7zOp g_ct7zProgressOp = Ct7zOp::Extract;
+static thread_local _7zProgressCb g__7zProgressCb = nullptr;
+static thread_local void* g__7zProgressUser = nullptr;
+static thread_local _7zOp g__7zProgressOp = _7zOp::Extract;
 
-struct Ct7zScopedProgress {
-    Ct7zProgressCb prevCb{};
+struct _7zScopedProgress {
+    _7zProgressCb prevCb{};
     void* prevUser{};
-    Ct7zOp prevOp{Ct7zOp::Extract};
-    Ct7zScopedProgress(Ct7zOp op, Ct7zProgressCb cb, void* user){
-        prevCb = g_ct7zProgressCb;
-        prevUser = g_ct7zProgressUser;
-        prevOp = g_ct7zProgressOp;
-        g_ct7zProgressCb = cb;
-        g_ct7zProgressUser = user;
-        g_ct7zProgressOp = op;
+    _7zOp prevOp{_7zOp::Extract};
+    _7zScopedProgress(_7zOp op, _7zProgressCb cb, void* user){
+        prevCb = g__7zProgressCb;
+        prevUser = g__7zProgressUser;
+        prevOp = g__7zProgressOp;
+        g__7zProgressCb = cb;
+        g__7zProgressUser = user;
+        g__7zProgressOp = op;
     }
-    ~Ct7zScopedProgress(){
-        g_ct7zProgressCb = prevCb;
-        g_ct7zProgressUser = prevUser;
-        g_ct7zProgressOp = prevOp;
+    ~_7zScopedProgress(){
+        g__7zProgressCb = prevCb;
+        g__7zProgressUser = prevUser;
+        g__7zProgressOp = prevOp;
     }
 };
 
@@ -341,10 +341,10 @@ Z7_COM7F_IMF(CArchiveExtractCallback::SetCompleted(const UInt64* completeValue))
 }
 
 void CArchiveExtractCallback::PrintProgress(bool force){
-    if(!g_ct7zProgressCb) return;
+    if(!g__7zProgressCb) return;
     if(TotalBytes==0){
         if(force){
-            g_ct7zProgressCb(g_ct7zProgressUser, g_ct7zProgressOp, 0, CurrentItem.Ptr());
+            g__7zProgressCb(g__7zProgressUser, g__7zProgressOp, 0, CurrentItem.Ptr());
         }
         return;
     }
@@ -359,7 +359,7 @@ void CArchiveExtractCallback::PrintProgress(bool force){
     LastPercent=percent;
     LastTick=tick;
 
-    g_ct7zProgressCb(g_ct7zProgressUser, g_ct7zProgressOp, (unsigned)percent, CurrentItem.Ptr());
+    g__7zProgressCb(g__7zProgressUser, g__7zProgressOp, (unsigned)percent, CurrentItem.Ptr());
 }
 
 
@@ -571,10 +571,10 @@ Z7_COM7F_IMF(CArchiveUpdateCallback::SetCompleted(const UInt64* completeValue)){
 }
 
 void CArchiveUpdateCallback::PrintProgress(bool force){
-    if(!g_ct7zProgressCb) return;
+    if(!g__7zProgressCb) return;
     if(TotalBytes==0){
         if(force){
-            g_ct7zProgressCb(g_ct7zProgressUser, g_ct7zProgressOp, 0, CurrentItem.Ptr());
+            g__7zProgressCb(g__7zProgressUser, g__7zProgressOp, 0, CurrentItem.Ptr());
         }
         return;
     }
@@ -589,7 +589,7 @@ void CArchiveUpdateCallback::PrintProgress(bool force){
     LastPercent=percent;
     LastTick=tick;
 
-    g_ct7zProgressCb(g_ct7zProgressUser, g_ct7zProgressOp, (unsigned)percent, CurrentItem.Ptr());
+    g__7zProgressCb(g__7zProgressUser, g__7zProgressOp, (unsigned)percent, CurrentItem.Ptr());
 }
 
 
@@ -819,7 +819,7 @@ HRESULT ExtractArchive7z(const FString& archivePath,const FString& outDir){
 // Public API
 // -------------------------
 
-void Ct7zSetHInstance(HINSTANCE hInst){
+void _7zSetHInstance(HINSTANCE hInst){
 #ifdef _WIN32
     g_hInstance = hInst;
 #else
@@ -827,43 +827,43 @@ void Ct7zSetHInstance(HINSTANCE hInst){
 #endif
 }
 
-HRESULT Ct7zExtract7z(
+HRESULT _7zExtra_7z(
     const wchar_t* archivePath,
     const wchar_t* outDir,
-    Ct7zProgressCb progressCb,
+    _7zProgressCb progressCb,
     void* progressUser)
 {
     if(!archivePath || !outDir) return E_INVALIDARG;
 #ifdef _WIN32
     NT_CHECK
 #endif
-    Ct7zScopedProgress sp(Ct7zOp::Extract, progressCb, progressUser);
+    _7zScopedProgress sp(_7zOp::Extract, progressCb, progressUser);
     const FString arc = us2fs(UString(archivePath));
     const FString out = us2fs(UString(outDir));
     HRESULT hr = ExtractArchive7z(arc, out);
     if(SUCCEEDED(hr) && progressCb){
-        progressCb(progressUser, Ct7zOp::Extract, 100, nullptr);
+        progressCb(progressUser, _7zOp::Extract, 100, nullptr);
     } 
     return hr;
 }
 
-HRESULT Ct7zCompress7z(
+HRESULT _7zCompress7z(
     const wchar_t* archivePath,
     const wchar_t* folderPath,
     bool includeTopDirectory,
-    Ct7zProgressCb progressCb,
+    _7zProgressCb progressCb,
     void* progressUser)
 {
     if(!archivePath || !folderPath) return E_INVALIDARG;
 #ifdef _WIN32
     NT_CHECK
 #endif
-    Ct7zScopedProgress sp(Ct7zOp::Compress, progressCb, progressUser);
+    _7zScopedProgress sp(_7zOp::Compress, progressCb, progressUser);
     const FString arc = us2fs(UString(archivePath));
     const FString dir = us2fs(UString(folderPath));
     HRESULT hr = CompressDirectory7zImpl(arc, dir, includeTopDirectory);
     if(SUCCEEDED(hr) && progressCb){
-        progressCb(progressUser, Ct7zOp::Compress, 100, nullptr);
+        progressCb(progressUser, _7zOp::Compress, 100, nullptr);
     }
     return hr;
 }

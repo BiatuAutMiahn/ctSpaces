@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
     <Filter Include="Source Files">
@@ -54,10 +54,52 @@
     <Image Include="small.ico">
       <Filter>Resource Files</Filter>
     </Image>
-    <Image Include="ctSpaces.ico">
+    <Image Include="icons\ctdkgrsq.ico">
       <Filter>Resource Files</Filter>
     </Image>
-    <Image Include="ctdkgrsq.ico">
+    <Image Include="icons\delete_b.ico">
+      <Filter>Resource Files</Filter>
+    </Image>
+    <Image Include="icons\delete_w.ico">
+      <Filter>Resource Files</Filter>
+    </Image>
+    <Image Include="icons\editdef_b.ico">
+      <Filter>Resource Files</Filter>
+    </Image>
+    <Image Include="icons\editdef_w.ico">
+      <Filter>Resource Files</Filter>
+    </Image>
+    <Image Include="icons\refresh_b.ico">
+      <Filter>Resource Files</Filter>
+    </Image>
+    <Image Include="icons\refresh_w.ico">
+      <Filter>Resource Files</Filter>
+    </Image>
+    <Image Include="icons\reset_b.ico">
+      <Filter>Resource Files</Filter>
+    </Image>
+    <Image Include="icons\reset_w.ico">
+      <Filter>Resource Files</Filter>
+    </Image>
+    <Image Include="icons\temp_b.ico">
+      <Filter>Resource Files</Filter>
+    </Image>
+    <Image Include="icons\temp_w.ico">
+      <Filter>Resource Files</Filter>
+    </Image>
+    <Image Include="icons\addico_b.ico">
+      <Filter>Resource Files</Filter>
+    </Image>
+    <Image Include="icons\addico_w.ico">
+      <Filter>Resource Files</Filter>
+    </Image>
+    <Image Include="icons\config_b.ico">
+      <Filter>Resource Files</Filter>
+    </Image>
+    <Image Include="icons\config_w.ico">
+      <Filter>Resource Files</Filter>
+    </Image>
+    <Image Include="icons\icon1.ico">
       <Filter>Resource Files</Filter>
     </Image>
   </ItemGroup>

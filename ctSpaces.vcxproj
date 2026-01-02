@@ -170,8 +170,22 @@
     <ResourceCompile Include="ctSpaces.rc" />
   </ItemGroup>
   <ItemGroup>
-    <Image Include="ctdkgrsq.ico" />
-    <Image Include="ctSpaces.ico" />
+    <Image Include="icons\addico_b.ico" />
+    <Image Include="icons\addico_w.ico" />
+    <Image Include="icons\config_b.ico" />
+    <Image Include="icons\config_w.ico" />
+    <Image Include="icons\ctdkgrsq.ico" />
+    <Image Include="icons\delete_b.ico" />
+    <Image Include="icons\delete_w.ico" />
+    <Image Include="icons\editdef_b.ico" />
+    <Image Include="icons\editdef_w.ico" />
+    <Image Include="icons\icon1.ico" />
+    <Image Include="icons\refresh_b.ico" />
+    <Image Include="icons\refresh_w.ico" />
+    <Image Include="icons\reset_b.ico" />
+    <Image Include="icons\reset_w.ico" />
+    <Image Include="icons\temp_b.ico" />
+    <Image Include="icons\temp_w.ico" />
     <Image Include="small.ico" />
   </ItemGroup>
   <ItemGroup>

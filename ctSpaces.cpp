@@ -40,18 +40,38 @@
 #include <iomanip> // FIX: Added for std::put_time
 #include <mutex> 
 #include <map> 
+#include <limits> // for std::numeric_limits
 
 #include "resource.h" // For IDR_7ZA and IDR_DEFAULT_7Z
 
 namespace fs=std::filesystem;
 
-struct IconButtonInfo{
-    int id;
-    HWND hWnd;
-    std::wstring symbol;
-    std::wstring tooltip;
-    std::function<void()> handler;
+//struct IconButtonInfo{
+//    int id;
+//    HWND hWnd;
+//    std::wstring symbol;
+//    std::wstring tooltip;
+//    std::function<void()> handler;
+//};
+
+#pragma pack(push, 2)
+struct GRPICONDIRENTRY{
+    BYTE  bWidth;
+    BYTE  bHeight;
+    BYTE  bColorCount;
+    BYTE  bReserved;
+    WORD  wPlanes;
+    WORD  wBitCount;
+    DWORD dwBytesInRes;
+    WORD  nID;            // RT_ICON id
 };
+struct GRPICONDIR{
+    WORD idReserved;
+    WORD idType;
+    WORD idCount;
+    GRPICONDIRENTRY idEntries[1];
+};
+#pragma pack(pop)
 
 #pragma pack(push, 1)
 typedef struct{
@@ -80,15 +100,22 @@ enum class ProfileType{
 };
 
 const std::wstring APP_ALIAS=L"ctSpaces";
-const std::wstring APP_VERSION=L"2.2";
-const std::wstring APP_TITLE=std::format(L"{} v{}b",APP_ALIAS,APP_VERSION);
+const std::wstring APP_VERSION=L"2.3";
+const std::wstring APP_VARIANT=L"pre3";
+const std::wstring APP_TITLE=std::format(L"{} v{}{}",APP_ALIAS,APP_VERSION,APP_VARIANT);
 const std::wstring GUI_CLASS_NAME=L"ctSpacesLauncherClass";
+HICON g_hIconBtnTemp=nullptr;
+HICON g_hIconBtnConfig=nullptr;
 ULONG_PTR g_gdiplusToken;
 HINSTANCE g_hInst;
 HWND g_hGui=NULL;
 HWND g_hComboClient=NULL;
 HWND g_hValidationTooltip=NULL;
 HWND g_hBtnGo=NULL;
+HWND g_hBtnTmpProf=NULL;
+HWND g_hBtnConfig=NULL;
+HMENU g_hConfigMenu=nullptr;
+std::vector<HBITMAP> g_menuBitmaps; // owned; freed on WM_DESTROY
 HFONT g_hFont=NULL;
 fs::path g_sDataDir;
 fs::path g_sEdgePath;
@@ -97,12 +124,63 @@ std::wstring g_sClientSel=L"";
 std::jthread g_watcherThread;
 std::mutex g_activeProfilesMutex;
 std::atomic<bool> g_isWatcherRunning=false;
-std::map<std::wstring,HICON> g_iconCache;
+struct IconCacheSet{
+    std::map<int,HICON> byPx; // requestedPx -> icon handle
+};
+std::map<std::wstring,IconCacheSet> g_iconCache;
+
 std::mutex g_iconCacheMutex;
 IShellLink* shellLink=NULL;
 #define WM_APP_TASK_COMPLETE (WM_APP + 1)
-// ===== InProc7z -> ProgressUI bridge =====
-struct CtSpaces7zUiCtx{
+#define IDC_BTN_TEMP   200
+#define IDC_BTN_CONFIG 201
+
+// Config menu command IDs
+#define IDM_CTX_SET_PROFILE_ICON     41001
+#define IDM_CTX_REFRESH_PROFILE      41002
+#define IDM_CTX_RESET_PROFILE        41003
+#define IDM_CTX_DELETE_PROFILE       41004
+#define IDM_CTX_EDIT_DEFAULT_PROFILE 41005
+#define IDC_ABOUT_ICON   5101
+#define IDC_ABOUT_TITLE  5102
+#define IDC_ABOUT_BY     5103
+#define IDC_ABOUT_GAP    5104
+#define IDC_ABOUT_HOME   5105
+#define IDC_STATIC_PROMPT 101
+#define IDC_GRP_ICON      301
+#define IDC_ICON_PREVIEW  302
+#define IDC_LBL_ICON      303
+
+static HWND g_hLblIcon=nullptr;
+
+
+// Icon preview controls/state
+static HWND  g_hGrpIcon=nullptr;
+static HWND  g_hIconPreview=nullptr;
+static HICON g_hIconPreviewHandle=nullptr;
+
+// Menu tooltip state
+static HWND     g_hMenuTip=nullptr;
+static TOOLINFOW g_menuTi{};
+static std::map<UINT,std::wstring> g_menuTipText; // menu id -> tooltip text
+
+
+
+static HFONT g_hFontAboutSmall=nullptr;
+static HICON g_hAboutIcon64=nullptr;
+static HICON g_hAboutDlgSmall=nullptr;
+static HICON g_hAboutDlgBig=nullptr;
+
+static HFONT GetAboutSmallFont(){
+    if(g_hFontAboutSmall) return g_hFontAboutSmall;
+    LOGFONTW lf{};
+    GetObjectW(g_hFont,sizeof(lf),&lf);
+    lf.lfHeight=(lf.lfHeight*85)/100; // smaller
+    g_hFontAboutSmall=CreateFontIndirectW(&lf);
+    return g_hFontAboutSmall;
+}
+
+struct _7zUiCtx{
     HWND mainWnd=nullptr;
     std::wstring status;
     int lastPercent=-999;
@@ -110,8 +188,13 @@ struct CtSpaces7zUiCtx{
     bool sentMarquee=false;
 };
 
-static void __stdcall CtSpaces7zProgress(void* user,Ct7zOp op,unsigned int percent,const wchar_t* /*currentItem*/){
-    auto* ctx=reinterpret_cast<CtSpaces7zUiCtx*>(user);
+struct AboutDlgState{
+    HICON hIco64=nullptr;
+    HFONT hSmall=nullptr;
+};
+
+static void __stdcall _7zProgress(void* user,_7zOp op,unsigned int percent,const wchar_t* /*currentItem*/){
+    auto* ctx=reinterpret_cast<_7zUiCtx*>(user);
     if(!ctx||!ctx->mainWnd||!IsWindow(ctx->mainWnd)) return;
 
     // Unknown progress -> marquee once.
@@ -226,7 +309,7 @@ Asset Store\
 
 */
 std::map<std::wstring,DWORD> g_activeProfiles;
-std::vector<IconButtonInfo> g_iconButtons;
+//std::vector<IconButtonInfo> g_iconButtons;
 std::vector<std::jthread> g_reaperThreads;
 
 void GuiProfOpen();
@@ -250,7 +333,7 @@ BOOL InitInstance(HINSTANCE,int);
 std::wstring AnsiToWide(const std::string& str);
 std::vector<std::wstring> GetSupportedImageTypes();
 bool ConvertImageToIcon(const fs::path& sourceImagePath,const fs::path& destIconPath);
-bool SaveIconsToFile(const fs::path& filePath,std::vector<HICON>& icons,bool compressLargeImages=true);
+bool SaveIconsToFile(const fs::path& filePath,std::vector<HICON>& icons,bool compressLargeImages=true,size_t startIndex=0);
 std::vector<BYTE> CompressBitmapToPng(HBITMAP hBitmap);
 CLSID GetEncoderClsid(const WCHAR* format);
 HICON Create32BitHICON(HICON hIcon);
@@ -270,6 +353,25 @@ static void LaunchProfileAsync(const std::wstring& name,bool isTemp,bool isDefau
 void GuiProfDel();
 inline void EnsureMouseVisible();
 inline void FocusClientEdit();
+static void ShowAboutDialog();
+static void EnsureConfigMenu(HWND hWnd);
+static UINT ShowConfigMenuFromButton(HWND hWnd);
+static void SetButtonIcon(HWND hBtn,int iconResId,HICON& hStore);
+static int IcoDim(BYTE b){return (b==0)?256:(int)b;}
+static HICON  LoadIconResBestDownscale(HINSTANCE hInst,int groupIconResId,int cxDesired,int cyDesired);
+static HICON  LoadIconFromIcoBestDownscale(const fs::path& icoPath,int pxDesired);
+static HBITMAP LoadMenuBitmapFromIconRes(int iconResId,UINT dpi,int cx,int cy);
+static HFONT CreateSmallerFontFrom(HFONT baseFont,int pxHeight,UINT dpi);
+static HICON ScaleIconDown_HQ(HICON hSrc,int dstCx,int dstCy);
+static bool GetIconSizePx(HICON hIcon,int& w,int& h);
+static void LayoutMainGui(HWND hWnd);
+static void UpdateIconPreviewForSelection(bool preferListSelection=false);
+static void EnsureMenuTooltips(HWND hWnd);
+static void HideMenuTooltip();
+static void HandleMenuSelect(HWND hWnd,WPARAM wParam,LPARAM lParam);
+static void UpdateConfigMenuEnabledState();
+static std::wstring GetSelectedClientNameSanitized(bool preferListSelection=false);
+static fs::path GetProfileDirFromName(const std::wstring& name);
 
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,_In_opt_ HINSTANCE,_In_ LPWSTR lpCmdLine,_In_ int nCmdShow){
     CoInitializeEx(NULL,COINIT_APARTMENTTHREADED|COINIT_DISABLE_OLE1DDE);
@@ -340,29 +442,29 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,_In_opt_ HINSTANCE,_In_ LPWSTR lp
 
     //InitCommonControlsEx(&icex);
     ProgressUI_Init(hInstance);
-    Ct7zSetHInstance(hInstance);
+    _7zSetHInstance(hInstance);
 
 
-    bool useTrdLayout=(wcsstr(lpCmdLine,L"~!Trd:P")!=nullptr);
-    g_iconButtons={
-        { 200, NULL, L"Ico", L"Set Profile Icon", GuiSetIcon },
-        { 201, NULL, L"Rst", L"Reset Selected Profile to Default", GuiProfReset },
-        { 202, NULL, L"Upd", L"Update Selected Profile with Default (Overwrites Profile /w Default)", GuiProfUpd },
-        { 203, NULL, L"Def", L"Modify Default Profile", GuiOpenDef },
-        { 204, NULL, L"Tmp", L"Launch temporary profile", GuiOpenTmp },
-        { 205, NULL, L"Del", L"Delete Profile", GuiProfDel },
-    };
-    if(useTrdLayout){
-        std::vector<IconButtonInfo> trdLayoutButtons={
-            g_iconButtons[0],
-            g_iconButtons[4],
-            g_iconButtons[2],
-            g_iconButtons[1],
-            g_iconButtons[3],
-            g_iconButtons[5]
-        };
-        g_iconButtons.swap(trdLayoutButtons);
-    }
+    //bool useTrdLayout=(wcsstr(lpCmdLine,L"~!Trd:P")!=nullptr);
+    //g_iconButtons={
+    //    { 200, NULL, L"Ico", L"Set Profile Icon", GuiSetIcon },
+    //    { 201, NULL, L"Rst", L"Reset Selected Profile to Default", GuiProfReset },
+    //    { 202, NULL, L"Upd", L"Update Selected Profile with Default (Overwrites Profile /w Default)", GuiProfUpd },
+    //    { 203, NULL, L"Def", L"Modify Default Profile", GuiOpenDef },
+    //    { 204, NULL, L"Tmp", L"Launch temporary profile", GuiOpenTmp },
+    //    { 205, NULL, L"Del", L"Delete Profile", GuiProfDel },
+    //};
+    //if(useTrdLayout){
+    //    std::vector<IconButtonInfo> trdLayoutButtons={
+    //        g_iconButtons[0],
+    //        g_iconButtons[4],
+    //        g_iconButtons[2],
+    //        g_iconButtons[1],
+    //        g_iconButtons[3],
+    //        g_iconButtons[5]
+    //    };
+    //    g_iconButtons.swap(trdLayoutButtons);
+    //}
 
     MyRegisterClass(hInstance);
     if(!InitInstance(hInstance,nCmdShow)){
@@ -418,7 +520,7 @@ ATOM MyRegisterClass(HINSTANCE hInstance){
 BOOL InitInstance(HINSTANCE hInstance,int nCmdShow){
     g_hInst=hInstance;
     const int iGuiW=256+64+16+8;
-    const int iGuiH=128+4;
+    const int iGuiH=128+16+8+4;
     const int iGuiM=4;
     const int iGuiCtrlW=(iGuiW-iGuiM*2);
     g_hFont=CreateFontW(15,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,DEFAULT_QUALITY,DEFAULT_PITCH|FF_MODERN,L"Consolas");
@@ -433,6 +535,8 @@ BOOL InitInstance(HINSTANCE hInstance,int nCmdShow){
     DwmSetWindowAttribute(g_hGui,DWMWA_USE_IMMERSIVE_DARK_MODE,&isDarkMode,sizeof(isDarkMode));
     CreateWindowW(L"STATIC",L"Select or type the client name:",WS_CHILD|WS_VISIBLE,iGuiM,iGuiM,iGuiCtrlW,17,g_hGui,(HMENU)101,hInstance,nullptr);
     g_hValidationTooltip=CreateWindowEx(WS_EX_TOPMOST,TOOLTIPS_CLASS,NULL,TTS_BALLOON|TTS_NOPREFIX|TTS_ALWAYSTIP,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,g_hGui,NULL,g_hInst,NULL);
+    SendMessageW(g_hGui,WM_SETFONT,(WPARAM)g_hFont,TRUE);
+    SendMessageW(g_hValidationTooltip,WM_SETFONT,(WPARAM)g_hFont,TRUE);
     SendMessage(g_hValidationTooltip,TTM_SETMAXTIPWIDTH,0,400);
     g_hComboClient=CreateWindowW(L"COMBOBOX",L"",WS_CHILD|WS_VISIBLE|CBS_DROPDOWN|CBS_AUTOHSCROLL|WS_VSCROLL,iGuiM,17+iGuiM*2,iGuiCtrlW-iGuiM*4,150,g_hGui,(HMENU)102,hInstance,nullptr);
     TOOLINFOW tic={sizeof(TOOLINFOW)};
@@ -444,14 +548,53 @@ BOOL InitInstance(HINSTANCE hInstance,int nCmdShow){
     SendMessage(g_hValidationTooltip,TTM_ADDTOOL,0,(LPARAM)&tic);
     g_hBtnGo=CreateWindowW(L"BUTTON",L"Go",WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON,(iGuiCtrlW/2)-32-4,(25*2)+iGuiM,64,33,g_hGui,(HMENU)IDOK,hInstance,nullptr);
     //HWND hToolTip=CreateWindowEx(0,TOOLTIPS_CLASS,NULL,TTS_ALWAYSTIP|TTS_NOPREFIX,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,g_hGui,NULL,g_hInst,NULL);
-    const int iBtnS=20,iBtnM=2;
-    int iBtnL=iGuiCtrlW-iGuiM*2-((iBtnS+iBtnM)*(static_cast<int>(g_iconButtons.size())+1))-8;
-    for(size_t ix=0; ix<g_iconButtons.size(); ++ix){
-        int iBtnT=iGuiH-((iBtnS+iBtnM)*(2-((ix/4)%((g_iconButtons.size()/4)*4))))-32-6;
-        int xPos=iBtnL+((iBtnS+iBtnM+10)*(static_cast<int>(ix%4)+1));
-        g_iconButtons[ix].hWnd=CreateWindowW(L"BUTTON",g_iconButtons[ix].symbol.c_str(),WS_CHILD|WS_VISIBLE,xPos,iBtnT,iBtnS+10,iBtnS,g_hGui,(HMENU)(INT_PTR)g_iconButtons[ix].id,g_hInst,nullptr);
-        CreateToolTip(g_iconButtons[ix].hWnd,g_hGui,(LPWSTR)g_iconButtons[ix].tooltip.c_str());
-    }
+    RECT rc{};
+    GetClientRect(g_hGui,&rc);
+    const int iBtnS=24,iBtnM=2,iBtnT=rc.bottom-iGuiM-iBtnS;
+    int iBtnL=rc.right-iGuiM-iBtnS;
+    g_hBtnConfig=CreateWindowW(L"BUTTON",L"",WS_CHILD|WS_VISIBLE|BS_ICON,iBtnL,iBtnT,iBtnS,iBtnS,g_hGui,(HMENU)(INT_PTR)201,g_hInst,nullptr);
+    g_hBtnTmpProf=CreateWindowW(L"BUTTON",L"",WS_CHILD|WS_VISIBLE|BS_ICON,iBtnL-iBtnS-iGuiM,iBtnT,iBtnS,iBtnS,g_hGui,(HMENU)(INT_PTR)200,g_hInst,nullptr);
+    SetButtonIcon(g_hBtnTmpProf,IDI_TEMPB,g_hIconBtnTemp);
+    SetButtonIcon(g_hBtnConfig,IDI_CFGB,g_hIconBtnConfig);
+    CreateToolTip(g_hBtnTmpProf,g_hGui,(LPWSTR)L"Launch temporary profile");
+    CreateToolTip(g_hBtnConfig,g_hGui,(LPWSTR)L"Options / Profile actions");
+    EnsureConfigMenu(g_hGui);
+
+    // Create the Icon group + preview (positions set by LayoutMainGui)
+    g_hGrpIcon=CreateWindowW(
+        L"BUTTON",L"",
+        WS_CHILD|WS_VISIBLE|BS_GROUPBOX,
+        0,0,10,10,
+        g_hGui,(HMENU)IDC_GRP_ICON,g_hInst,nullptr
+    );
+    g_hLblIcon=CreateWindowW(
+        L"STATIC",L"Icon",
+        WS_CHILD|WS_VISIBLE|SS_LEFT|SS_NOPREFIX,
+        0,0,10,10,
+        g_hGui,(HMENU)IDC_LBL_ICON,g_hInst,nullptr
+    );
+    g_hIconPreview=CreateWindowW(
+        L"STATIC",L"",
+        WS_CHILD|WS_VISIBLE|SS_ICON,
+        0,0,10,10,
+        g_hGui,(HMENU)IDC_ICON_PREVIEW,g_hInst,nullptr
+    );
+    SendMessageW(g_hGrpIcon,WM_SETFONT,(WPARAM)g_hFont,TRUE);
+    SendMessageW(g_hLblIcon,WM_SETFONT,(WPARAM)g_hFont,TRUE);
+    SendMessageW(g_hIconPreview,WM_SETFONT,(WPARAM)g_hFont,TRUE);
+    EnsureMenuTooltips(g_hGui);
+
+    // Apply layout (also makes Go square + centered)
+    LayoutMainGui(g_hGui);
+
+    // Initial preview
+    UpdateIconPreviewForSelection();
+    //for(size_t ix=0; ix<g_iconButtons.size(); ++ix){
+    //    int iBtnT=iGuiH-((iBtnS+iBtnM)*(2-((ix/4)%((g_iconButtons.size()/4)*4))))-32-6;
+    //    int xPos=iBtnL+((iBtnS+iBtnM+10)*(static_cast<int>(ix%4)+1));
+    //    g_iconButtons[ix].hWnd=CreateWindowW(L"BUTTON",g_iconButtons[ix].symbol.c_str(),WS_CHILD|WS_VISIBLE,xPos,iBtnT,iBtnS+10,iBtnS,g_hGui,(HMENU)(INT_PTR)g_iconButtons[ix].id,g_hInst,nullptr);
+    //    CreateToolTip(g_iconButtons[ix].hWnd,g_hGui,(LPWSTR)g_iconButtons[ix].tooltip.c_str());
+    //}
     EnumChildWindows(g_hGui,[](HWND hwnd,LPARAM lParam)->BOOL{SendMessage(hwnd,WM_SETFONT,(WPARAM)lParam,TRUE);return TRUE;},(LPARAM)g_hFont);
     UpdateClientsComboBox();
     SetFocus(g_hComboClient);
@@ -487,6 +630,7 @@ LRESULT CALLBACK WndProc(HWND hWnd,UINT message,WPARAM wParam,LPARAM lParam){
                         ti.uId=(UINT_PTR)g_hComboClient;
                         SendMessage(g_hValidationTooltip,TTM_TRACKACTIVATE,FALSE,(LPARAM)&ti);
                     }
+                    UpdateIconPreviewForSelection(false);
                     return 0;
                 }
                 if(hasInvalidChar){
@@ -545,16 +689,51 @@ LRESULT CALLBACK WndProc(HWND hWnd,UINT message,WPARAM wParam,LPARAM lParam){
                     }
 
                 }
+                UpdateIconPreviewForSelection(false);
+                return 0;
+            }
+            if(wmEvent==CBN_SELCHANGE){
+                UpdateIconPreviewForSelection(true);
+                return 0;
+            }
+            if(wmEvent==CBN_SELENDOK){
+                UpdateIconPreviewForSelection(true);  // also fine (commit point)
+                return 0;
+            }
+            if(wmEvent==CBN_CLOSEUP){
+                UpdateIconPreviewForSelection(true);
+                return 0;
+            }
+            if(wmEvent==CBN_KILLFOCUS){
+                UpdateIconPreviewForSelection(false);
+                return 0;
             }
         } else if(wmId==IDOK){
             GuiProfOpen();
+        } else if(wmId==IDC_BTN_TEMP&&wmEvent==BN_CLICKED){
+            GuiOpenTmp();
+        } else if(wmId==IDC_BTN_CONFIG&&wmEvent==BN_CLICKED){
+            UINT cmd=ShowConfigMenuFromButton(hWnd);
+            if(cmd) SendMessageW(hWnd,WM_COMMAND,cmd,0);
+        } else if(wmId==IDM_CTX_SET_PROFILE_ICON){
+            GuiSetIcon();
+        } else if(wmId==IDM_CTX_REFRESH_PROFILE){
+            GuiProfUpd();
+        } else if(wmId==IDM_CTX_RESET_PROFILE){
+            GuiProfReset();
+        } else if(wmId==IDM_CTX_DELETE_PROFILE){
+            GuiProfDel();
+        } else if(wmId==IDM_CTX_EDIT_DEFAULT_PROFILE){
+            GuiOpenDef();
+        } else if(wmId==IDM_ABOUT){
+            ShowAboutDialog();
         } else{
-            auto it=std::find_if(g_iconButtons.begin(),g_iconButtons.end(),[wmId](const auto& btn){
-                return btn.id==wmId;
-            });
-            if(it!=g_iconButtons.end()&&it->handler){
-                it->handler();
-            }
+            //auto it=std::find_if(g_iconButtons.begin(),g_iconButtons.end(),[wmId](const auto& btn){
+            //    return btn.id==wmId;
+            //});
+            //if(it!=g_iconButtons.end()&&it->handler){
+            //    it->handler();
+            //}
         }
         return 0;
     }
@@ -611,6 +790,7 @@ LRESULT CALLBACK WndProc(HWND hWnd,UINT message,WPARAM wParam,LPARAM lParam){
                 SetWindowText(g_hComboClient,clientName.c_str());
             }
         }
+        UpdateIconPreviewForSelection(true);
         FocusClientEdit();
         return 0;
     }
@@ -639,6 +819,34 @@ LRESULT CALLBACK WndProc(HWND hWnd,UINT message,WPARAM wParam,LPARAM lParam){
         return 0;
     }
     case WM_DESTROY: {
+        for(auto hbmp:g_menuBitmaps){
+            if(hbmp) DeleteObject(hbmp);
+        }
+        g_menuBitmaps.clear();
+        if(g_hConfigMenu){
+            DestroyMenu(g_hConfigMenu);
+            g_hConfigMenu=nullptr;
+            
+        }
+        if(g_hIconBtnTemp){
+            DestroyIcon(g_hIconBtnTemp);
+            g_hIconBtnTemp=nullptr;
+            
+        }
+        if(g_hIconBtnConfig){
+            DestroyIcon(g_hIconBtnConfig);
+            g_hIconBtnConfig=nullptr;
+            
+        }
+        if(g_hIconPreviewHandle){
+            DestroyIcon(g_hIconPreviewHandle);
+            g_hIconPreviewHandle=nullptr;
+        }
+        if(g_hMenuTip){
+            DestroyWindow(g_hMenuTip);
+            g_hMenuTip=nullptr;
+        }
+        if(g_hFontAboutSmall){ DeleteObject(g_hFontAboutSmall); g_hFontAboutSmall=nullptr; }
         if(g_hFont) DeleteObject(g_hFont);
         PostQuitMessage(0);
         break;
@@ -653,6 +861,35 @@ LRESULT CALLBACK WndProc(HWND hWnd,UINT message,WPARAM wParam,LPARAM lParam){
         FocusClientEdit();
         return 0;
     }
+    case WM_DPICHANGED: {
+        SetButtonIcon(g_hBtnTmpProf,IDI_TEMPB,g_hIconBtnTemp);
+        SetButtonIcon(g_hBtnConfig,IDI_CFGB,g_hIconBtnConfig);
+
+        if(g_hConfigMenu){
+            for(auto hb:g_menuBitmaps) if(hb) DeleteObject(hb);
+            g_menuBitmaps.clear();
+            DestroyMenu(g_hConfigMenu);
+            g_hConfigMenu=nullptr;
+            EnsureConfigMenu(hWnd);
+        }
+
+        LayoutMainGui(hWnd);
+        UpdateIconPreviewForSelection(true);
+        return 0;
+    }
+    case WM_SIZE:
+        LayoutMainGui(hWnd);
+        return 0;
+
+    case WM_MENUSELECT:
+        EnsureMenuTooltips(hWnd);
+        HandleMenuSelect(hWnd,wParam,lParam);
+        return 0;
+
+    case WM_EXITMENULOOP:
+        HideMenuTooltip();
+        return 0;
+
     default:
         return DefWindowProc(hWnd,message,wParam,lParam);
     }
@@ -683,20 +920,24 @@ void GuiProfOpen(){
 
 void GuiSetIcon(){
     SetUiState(false);
+
     wchar_t clientNameBuffer[256];
     GetWindowText(g_hComboClient,clientNameBuffer,256);
     std::wstring clientName=SanitizeName(clientNameBuffer);
+
     if(clientName.empty()){
         MessageBox(g_hGui,L"Please select a client first.",L"Warning",MB_OK|MB_ICONWARNING);
         SetUiState(true);
         return;
     }
+
     std::wstring filter;
     std::wstring allSupportedExtensions=L"*.ico";
     std::vector<std::wstring> types=GetSupportedImageTypes();
     for(const auto& type:types){
         allSupportedExtensions+=L";*."+type;
     }
+
     filter+=L"Supported Image Files ("+allSupportedExtensions+L")";
     filter+=L'\0';
     filter+=allSupportedExtensions;
@@ -710,6 +951,7 @@ void GuiSetIcon(){
     filter+=L"*.*";
     filter+=L'\0';
     filter+=L'\0';
+
     wchar_t szFile[MAX_PATH]={0};
     OPENFILENAMEW ofn={0};
     ofn.lStructSize=sizeof(ofn);
@@ -719,46 +961,52 @@ void GuiSetIcon(){
     ofn.lpstrFilter=filter.c_str();
     ofn.nFilterIndex=1;
     ofn.Flags=OFN_PATHMUSTEXIST|OFN_FILEMUSTEXIST;
+
     if(GetOpenFileNameW(&ofn)){
         fs::path sourcePath(ofn.lpstrFile);
         fs::path destIconPath=g_sDataDir/"Sites"/clientName/"client.ico";
         fs::create_directories(destIconPath.parent_path());
+
         bool success=false;
         std::wstring errorDetails;
+
         try{
             if(_wcsicmp(sourcePath.extension().c_str(),L".ico")==0){
                 fs::copy_file(sourcePath,destIconPath,fs::copy_options::overwrite_existing);
                 success=true;
             } else{
                 success=ConvertImageToIcon(sourcePath,destIconPath);
-                if(!success){
-                    errorDetails=L"Could not convert image to icon format.";
-                }
+                if(!success) errorDetails=L"Could not convert image to icon format.";
             }
         } catch(const fs::filesystem_error& e){
             success=false;
             errorDetails=AnsiToWide(e.what());
         }
+
         if(success){
             MessageBox(g_hGui,L"Icon has been configured.",L"Success",MB_OK|MB_ICONINFORMATION);
-            std::lock_guard<std::mutex> cacheLock(g_iconCacheMutex);
-            if(g_iconCache.count(clientName)){
-                if(g_iconCache[clientName]){
-                    DestroyIcon(g_iconCache[clientName]);
+
+            // IMPORTANT: nuke cached icons for this client (all sizes)
+            {
+                std::lock_guard<std::mutex> cacheLock(g_iconCacheMutex);
+                auto it=g_iconCache.find(clientName);
+                if(it!=g_iconCache.end()){
+                    for(auto& [px,hIcon]:it->second.byPx){
+                        if(hIcon) DestroyIcon(hIcon);
+                    }
+                    g_iconCache.erase(it);
                 }
-                HICON hNewIcon=(HICON)LoadImageW(NULL,destIconPath.c_str(),IMAGE_ICON,0,0,LR_LOADFROMFILE|LR_DEFAULTSIZE|LR_SHARED);
-                g_iconCache[clientName]=hNewIcon;
             }
         } else{
             std::wstring errorMsg=L"Failed to set icon.";
-            if(!errorDetails.empty()){
-                errorMsg+=L"\n\nDetails: "+errorDetails;
-            }
+            if(!errorDetails.empty()) errorMsg+=L"\n\nDetails: "+errorDetails;
             MessageBox(g_hGui,errorMsg.c_str(),L"Error",MB_OK|MB_ICONERROR);
         }
     }
+    UpdateIconPreviewForSelection(false);
     SetUiState(true);
 }
+
 
 void GuiProfReset(){
     SetUiState(false);
@@ -941,9 +1189,11 @@ bool ExtractResourceToFile(UINT resourceID,const fs::path& destPath){
 void SetUiState(bool enabled){
     EnableWindow(g_hComboClient,enabled);
     EnableWindow(g_hBtnGo,enabled);
-    for(const auto& btn:g_iconButtons){
-        EnableWindow(btn.hWnd,enabled);
-    }
+    EnableWindow(g_hBtnTmpProf,enabled);
+    EnableWindow(g_hBtnConfig,enabled);
+    //for(const auto& btn:g_iconButtons){
+    //    EnableWindow(btn.hWnd,enabled);
+    //}
     if(enabled)
         FocusClientEdit();
 }
@@ -962,22 +1212,22 @@ bool extDef(const fs::path& profileDataPath,const wchar_t* statusText){
     try{
         fs::create_directories(profileDataPath);
     } catch(...){
-        // best-effort; Ct7zExtract7z will fail if path can't be created
+        // best-effort; _7zExtra_7z will fail if path can't be created
     }
 
     // Always create our marker file on success (your "profile exists" sentinel).
     const fs::path markerPath=profileDataPath/L"ctSpaces";
 
-    CtSpaces7zUiCtx ctx;
+    _7zUiCtx ctx;
     ctx.mainWnd=g_hGui;
     ctx.status=(statusText&&*statusText)?statusText:L"Loading Default Profile...";
 
     ProgressUI_PostShow(ctx.mainWnd,ctx.status,-1);
 
-    HRESULT hr=Ct7zExtract7z(
+    HRESULT hr=_7zExtra_7z(
         default7zPath.c_str(),
         profileDataPath.c_str(),
-        &CtSpaces7zProgress,
+        &_7zProgress,
         &ctx
     );
 
@@ -1060,20 +1310,20 @@ std::wstring AnsiToWide(const std::string& str){
 
 std::vector<std::wstring> GetSupportedImageTypes(){
     std::vector<std::wstring> supportedTypes;
-    UINT numDecoders=0,size=0;
-    Gdiplus::GetImageDecodersSize(&numDecoders,&size);
-    if(size==0) return supportedTypes;
-    std::unique_ptr<Gdiplus::ImageCodecInfo[]> pImageCodecInfo(new Gdiplus::ImageCodecInfo[size]);
-    if(!pImageCodecInfo) return supportedTypes;
-    Gdiplus::GetImageDecoders(numDecoders,size,pImageCodecInfo.get());
+    UINT numDecoders=0,sizeBytes=0;
+    Gdiplus::GetImageDecodersSize(&numDecoders,&sizeBytes);
+    if(sizeBytes==0) return supportedTypes;
+
+    std::vector<BYTE> buf(sizeBytes);
+    auto* p=(Gdiplus::ImageCodecInfo*)buf.data();
+    Gdiplus::GetImageDecoders(numDecoders,sizeBytes,p);
+
     for(UINT i=0; i<numDecoders; ++i){
-        std::wstring extensions(pImageCodecInfo[i].FilenameExtension);
+        std::wstring extensions(p[i].FilenameExtension);
         std::wstringstream ss(extensions);
         std::wstring ext;
         while(std::getline(ss,ext,L';')){
-            if(ext.rfind(L"*.",0)==0){
-                ext=ext.substr(2);
-            }
+            if(ext.rfind(L"*.",0)==0) ext=ext.substr(2);
             std::transform(ext.begin(),ext.end(),ext.begin(),::towlower);
             if(ext!=L"ico"&&std::find(supportedTypes.begin(),supportedTypes.end(),ext)==supportedTypes.end()){
                 supportedTypes.push_back(ext);
@@ -1083,60 +1333,55 @@ std::vector<std::wstring> GetSupportedImageTypes(){
     return supportedTypes;
 }
 
-bool ConvertImageToIcon(const fs::path& sourceImagePath,const fs::path& destIconPath){
-    std::unique_ptr<Gdiplus::Bitmap> sourceBitmap(Gdiplus::Bitmap::FromFile(sourceImagePath.c_str()));
-    if(!sourceBitmap||sourceBitmap->GetLastStatus()!=Gdiplus::Ok){
-        return false;
-    }
-    UINT sourceWidth=sourceBitmap->GetWidth();
-    UINT sourceHeight=sourceBitmap->GetHeight();
-    int masterSize=max(sourceWidth,sourceHeight);
-    auto masterScaledBitmap=std::make_unique<Gdiplus::Bitmap>(masterSize,masterSize,PixelFormat32bppARGB);
-    {
-        auto graphics=std::make_unique<Gdiplus::Graphics>(masterScaledBitmap.get());
-        graphics->SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
-        graphics->SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
-        auto imageAttributes=std::make_unique<Gdiplus::ImageAttributes>();
-        imageAttributes->SetWrapMode(Gdiplus::WrapModeTileFlipXY);
-        graphics->DrawImage(
-            sourceBitmap.get(),
-            Gdiplus::RectF(0.0f,0.0f,(Gdiplus::REAL)masterSize,(Gdiplus::REAL)masterSize),
-            0.0f,0.0f,(Gdiplus::REAL)sourceWidth,(Gdiplus::REAL)sourceHeight,
-            Gdiplus::UnitPixel,imageAttributes.get()
-        );
-    }
-    const std::vector<int> sizes={256, 128, 64, 48, 32, 24, 16};
-    std::vector<HICON> hIcons;
-    for(int targetSize:sizes){
-        if(targetSize>=masterSize) continue;
-        auto finalSizeBitmap=std::make_unique<Gdiplus::Bitmap>(targetSize,targetSize,PixelFormat32bppARGB);
-        {
-            auto graphics=std::make_unique<Gdiplus::Graphics>(finalSizeBitmap.get());
-            graphics->SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
-            graphics->SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
-            auto imageAttributes=std::make_unique<Gdiplus::ImageAttributes>();
-            imageAttributes->SetWrapMode(Gdiplus::WrapModeTileFlipXY);
-            graphics->DrawImage(
-                masterScaledBitmap.get(),
-                Gdiplus::RectF(0.0f,0.0f,(Gdiplus::REAL)targetSize,(Gdiplus::REAL)targetSize),
-                0.0f,0.0f,(Gdiplus::REAL)masterSize,(Gdiplus::REAL)masterSize,
-                Gdiplus::UnitPixel,imageAttributes.get()
-            );
-        }
-        HICON hIcon=NULL;
-        if(finalSizeBitmap->GetHICON(&hIcon)==Gdiplus::Ok){
-            hIcons.push_back(hIcon);
-        }
-    }
-    if(hIcons.empty()){
-        return false;
-    }
-    bool result=SaveIconsToFile(destIconPath,hIcons);
-    for(HICON hIcon:hIcons){
-        DestroyIcon(hIcon);
-    }
-    return result;
+static std::unique_ptr<Gdiplus::Bitmap> ResizeBitmap_StretchSquare(Gdiplus::Bitmap* src,int dstW,int dstH){
+    auto dst=std::make_unique<Gdiplus::Bitmap>(dstW,dstH,PixelFormat32bppARGB);
+    Gdiplus::Graphics g(dst.get());
+    g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+    g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+
+    // AutoIt _GDIPlus_ImageResize() behavior here is effectively a stretch to requested size.
+    g.DrawImage(src,0,0,dstW,dstH);
+    return dst;
 }
+
+bool ConvertImageToIcon(const fs::path& sourceImagePath,const fs::path& destIconPath){
+    std::unique_ptr<Gdiplus::Bitmap> src(Gdiplus::Bitmap::FromFile(sourceImagePath.c_str()));
+    if(!src||src->GetLastStatus()!=Gdiplus::Ok) return false;
+
+    const UINT w=src->GetWidth();
+    const UINT h=src->GetHeight();
+    const int iSize=(int)max(w,h);
+
+    // Stretch to square (matches your AutoIt-style behavior)
+    auto scaled=ResizeBitmap_StretchSquare(src.get(),iSize,iSize);
+    if(!scaled||scaled->GetLastStatus()!=Gdiplus::Ok) return false;
+
+    // Requested canonical sizes
+    const int sizes[]={16,32,48,64,128,256};
+
+    std::vector<HICON> icons;
+    icons.reserve(6);
+
+    for(int s:sizes){
+        if(s>iSize) continue; // NEVER upscale; only generate sizes <= source square
+        auto bmp=ResizeBitmap_StretchSquare(scaled.get(),s,s);
+        if(!bmp||bmp->GetLastStatus()!=Gdiplus::Ok) return false;
+
+        HICON hIco=NULL;
+        if(bmp->GetHICON(&hIco)==Gdiplus::Ok&&hIco){
+            icons.push_back(hIco);
+        }
+    }
+
+    if(icons.empty()) return false;
+
+    // IMPORTANT: don't skip index 0 (this was dropping your 16px)
+    bool ok=SaveIconsToFile(destIconPath,icons, /*compress*/true, /*startIndex*/0);
+
+    for(HICON hIco:icons) DestroyIcon(hIco);
+    return ok;
+}
+
 
 HICON Create32BitHICON(HICON hIcon){
     ICONINFOEXW iconInfo={sizeof(ICONINFOEXW)};
@@ -1221,25 +1466,23 @@ CLSID GetEncoderClsid(const WCHAR* format){
     return {0};
 }
 bool IsAlphaBitmap(HBITMAP hBitmap){
-    BITMAP bmp={0};
-    if(!GetObject(hBitmap,sizeof(BITMAP),&bmp)){
-        return false;
-    }
-    if(bmp.bmBitsPixel!=32){
-        return false;
-    }
-    int dataSize=bmp.bmWidthBytes*bmp.bmHeight;
-    auto pixelData=std::make_unique<BYTE[]>(dataSize);
-    if(GetBitmapBits(hBitmap,dataSize,pixelData.get())==0){
-        return false;
-    }
-    for(int i=0; i<dataSize; i+=4){
-        if(pixelData[i+3]<255){
-            return true;
-        }
+    BITMAP bmp{};
+    if(!GetObject(hBitmap,sizeof(bmp),&bmp)) return false;
+    if(bmp.bmBitsPixel!=32) return false;
+
+    const int dataSize=bmp.bmWidthBytes*bmp.bmHeight;
+    if(dataSize<=0) return false;
+
+    std::vector<BYTE> pixels((size_t)dataSize);
+    if(GetBitmapBits(hBitmap,dataSize,pixels.data())==0) return false;
+
+    // AutoIt __AlphaProc(): considers alpha "present" if any A != 0
+    for(int i=3; i<dataSize; i+=4){
+        if(pixels[i]!=0) return true;
     }
     return false;
 }
+
 std::vector<BYTE> CompressBitmapToPng(HBITMAP hBitmap){
     std::unique_ptr<Gdiplus::Bitmap> bitmap(Gdiplus::Bitmap::FromHBITMAP(hBitmap,NULL));
     if(!bitmap||bitmap->GetLastStatus()!=Gdiplus::Ok){
@@ -1266,100 +1509,220 @@ std::vector<BYTE> CompressBitmapToPng(HBITMAP hBitmap){
     }
     return buffer;
 }
-bool SaveIconsToFile(const fs::path& filePath,std::vector<HICON>& icons,bool compressLargeImages){
-    if(icons.empty()){
-        return false;
+#pragma pack(push, 1)
+struct ICONDIRHDR{
+    WORD idReserved;
+    WORD idType;
+    WORD idCount;
+};
+#pragma pack(pop)
+
+static bool WriteAll(HANDLE hFile,const void* data,DWORD cb){
+    const BYTE* p=(const BYTE*)data;
+    DWORD total=0;
+    while(total<cb){
+        DWORD w=0;
+        if(!WriteFile(hFile,p+total,cb-total,&w,nullptr)) return false;
+        if(w==0) return false;
+        total+=w;
     }
-    std::ofstream file(filePath,std::ios::binary);
-    if(!file.is_open()){
-        return false;
-    }
-    std::vector<HICON> tempIcons;
-    auto cleanup=[&](){
-        for(HICON hTemp:tempIcons){
-            DestroyIcon(hTemp);
-        }
-    };
-    std::vector<std::vector<BYTE>> allIconImageData;
-    std::vector<ICONDIRENTRY> allIconDirEntries;
-    for(size_t i=0; i<icons.size(); ++i){
-        HICON hCurrentImage=icons[i];
-        ICONINFOEXW iconInfo={sizeof(ICONINFOEXW)};
-        if(!GetIconInfoExW(hCurrentImage,&iconInfo)){
-            cleanup();
-            file.close();
-            return false;
-        }
-        BITMAP bmpColorInfo={0};
-        GetObject(iconInfo.hbmColor,sizeof(BITMAP),&bmpColorInfo);
-        if(bmpColorInfo.bmBitsPixel!=32||!IsAlphaBitmap(iconInfo.hbmColor)){
-            HICON hNew32BitIcon=Create32BitHICON(hCurrentImage);
-            if(hNew32BitIcon){
-                DestroyIcon(hCurrentImage);
-                icons[i]=hNew32BitIcon;
-                hCurrentImage=hNew32BitIcon;
-                tempIcons.push_back(hNew32BitIcon);
-                GetIconInfoExW(hCurrentImage,&iconInfo);
-                GetObject(iconInfo.hbmColor,sizeof(BITMAP),&bmpColorInfo);
-            }
-        }
-        std::vector<BYTE> imageDataBlock;
-        bool isCompressed=false;
-        if(compressLargeImages&&bmpColorInfo.bmWidth>=256){
-            std::vector<BYTE> pngData=CompressBitmapToPng(iconInfo.hbmColor);
-            if(!pngData.empty()){
-                imageDataBlock=pngData;
-                isCompressed=true;
-            }
-        }
-        if(!isCompressed){
-            int colorDataSize=bmpColorInfo.bmWidthBytes*bmpColorInfo.bmHeight;
-            std::vector<BYTE> colorData(colorDataSize);
-            GetBitmapBits(iconInfo.hbmColor,colorDataSize,colorData.data());
-            BITMAP bmpMaskInfo={0};
-            GetObject(iconInfo.hbmMask,sizeof(BITMAP),&bmpMaskInfo);
-            int maskDataSize=bmpMaskInfo.bmWidthBytes*bmpMaskInfo.bmHeight;
-            std::vector<BYTE> maskData(maskDataSize);
-            GetBitmapBits(iconInfo.hbmMask,maskDataSize,maskData.data());
-            BITMAPINFOHEADER bih={0};
-            bih.biSize=sizeof(BITMAPINFOHEADER);
-            bih.biWidth=bmpColorInfo.bmWidth;
-            bih.biHeight=bmpColorInfo.bmHeight*2;
-            bih.biPlanes=1;
-            bih.biBitCount=bmpColorInfo.bmBitsPixel;
-            bih.biCompression=BI_RGB;
-            imageDataBlock.insert(imageDataBlock.end(),reinterpret_cast<BYTE*>(&bih),reinterpret_cast<BYTE*>(&bih)+sizeof(bih));
-            imageDataBlock.insert(imageDataBlock.end(),colorData.begin(),colorData.end());
-            imageDataBlock.insert(imageDataBlock.end(),maskData.begin(),maskData.end());
-        }
-        allIconImageData.push_back(imageDataBlock);
-        ICONDIRENTRY entry={0};
-        entry.bWidth=(bmpColorInfo.bmWidth>=256)?0:(BYTE)bmpColorInfo.bmWidth;
-        entry.bHeight=(bmpColorInfo.bmHeight>=256)?0:(BYTE)bmpColorInfo.bmHeight;
-        entry.wPlanes=1;
-        entry.wBitCount=bmpColorInfo.bmBitsPixel;
-        entry.dwBytesInRes=static_cast<DWORD>(imageDataBlock.size());
-        allIconDirEntries.push_back(entry);
-        DeleteObject(iconInfo.hbmColor);
-        DeleteObject(iconInfo.hbmMask);
-    }
-    ICONDIR iconDirHeader={0};
-    iconDirHeader.idType=1;
-    iconDirHeader.idCount=static_cast<WORD>(icons.size());
-    file.write(reinterpret_cast<char*>(&iconDirHeader),sizeof(WORD)*3);
-    DWORD currentOffset=sizeof(iconDirHeader.idReserved)+sizeof(iconDirHeader.idType)+sizeof(iconDirHeader.idCount)+(icons.size()*sizeof(ICONDIRENTRY));
-    for(auto& entry:allIconDirEntries){
-        entry.dwImageOffset=currentOffset;
-        currentOffset+=entry.dwBytesInRes;
-    }
-    file.write(reinterpret_cast<char*>(allIconDirEntries.data()),allIconDirEntries.size()*sizeof(ICONDIRENTRY));
-    for(const auto& data:allIconImageData){
-        file.write(reinterpret_cast<const char*>(data.data()),data.size());
-    }
-    file.close();
-    cleanup();
     return true;
 }
+
+bool SaveIconsToFile(const fs::path& filePath,std::vector<HICON>& icons,bool compressLargeImages,size_t startIndex){
+    if(icons.size()<=startIndex) return false;
+
+    const size_t count=icons.size()-startIndex;
+
+    HANDLE hFile=CreateFileW(
+        filePath.c_str(),
+        GENERIC_WRITE,
+        FILE_SHARE_READ,   // matches AutoIt share=4
+        nullptr,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr
+    );
+    if(hFile==INVALID_HANDLE_VALUE) return false;
+
+    std::vector<ICONDIRENTRY> entries(count);
+    ICONDIRHDR hdr{};
+    hdr.idReserved=0;
+    hdr.idType=1;
+    hdr.idCount=(WORD)count;
+
+    // AutoIt writes placeholder header+entries, streams image data, then seeks back and rewrites.
+    if(!WriteAll(hFile,&hdr,sizeof(hdr))){
+        CloseHandle(hFile);
+        DeleteFileW(filePath.c_str());
+        return false;
+    }
+    {
+        std::vector<BYTE> zero(sizeof(ICONDIRENTRY)*count,0);
+        if(!WriteAll(hFile,zero.data(),(DWORD)zero.size())){
+            CloseHandle(hFile);
+            DeleteFileW(filePath.c_str());
+            return false;
+        }
+    }
+
+    DWORD offset=(DWORD)(sizeof(ICONDIRHDR)+sizeof(ICONDIRENTRY)*count);
+
+    std::vector<HICON> tempIcons; // like AutoIt $aTemp[]
+    tempIcons.reserve(count);
+
+    auto fail=[&](void){
+        for(HICON h:tempIcons) DestroyIcon(h);
+        CloseHandle(hFile);
+        DeleteFileW(filePath.c_str());
+    };
+
+    for(size_t i=0; i<count; ++i){
+        HICON hIcon=icons[startIndex+i];
+        bool didTemp=false;
+
+        for(int attempt=0; attempt<2; ++attempt){
+            ICONINFO ii{};
+            if(!GetIconInfo(hIcon,&ii)){
+                fail();
+                return false;
+            }
+
+            // AutoIt: CopyImage(..., 0x2008 = LR_CREATEDIBSECTION | LR_COPYDELETEORG)
+            HBITMAP hMask=(HBITMAP)CopyImage(ii.hbmMask,IMAGE_BITMAP,0,0,LR_CREATEDIBSECTION|LR_COPYDELETEORG);
+            HBITMAP hColor=(HBITMAP)CopyImage(ii.hbmColor,IMAGE_BITMAP,0,0,LR_CREATEDIBSECTION|LR_COPYDELETEORG);
+
+            // If CopyImage failed, originals weren't deleted; clean them.
+            if(!hMask||!hColor){
+                if(ii.hbmMask) DeleteObject(ii.hbmMask);
+                if(ii.hbmColor) DeleteObject(ii.hbmColor);
+                if(hMask) DeleteObject(hMask);
+                if(hColor) DeleteObject(hColor);
+                fail();
+                return false;
+            }
+
+            DIBSECTION dsMask{};
+            DIBSECTION dsColor{};
+            if(GetObject(hMask,sizeof(dsMask),&dsMask)!=sizeof(dsMask)||
+               GetObject(hColor,sizeof(dsColor),&dsColor)!=sizeof(dsColor)){
+                DeleteObject(hMask);
+                DeleteObject(hColor);
+                fail();
+                return false;
+            }
+
+            DWORD maskSize=dsMask.dsBmih.biSizeImage;
+            DWORD colorSize=dsColor.dsBmih.biSizeImage;
+            if(maskSize==0)  maskSize=(DWORD)(dsMask.dsBm.bmWidthBytes*dsMask.dsBm.bmHeight);
+            if(colorSize==0) colorSize=(DWORD)(dsColor.dsBm.bmWidthBytes*dsColor.dsBm.bmHeight);
+
+            const int bpp=dsColor.dsBm.bmBitsPixel;
+            if(bpp!=16&&bpp!=24&&bpp!=32){
+                DeleteObject(hMask);
+                DeleteObject(hColor);
+                fail();
+                return false;
+            }
+
+            // AutoIt: for 32bpp, if not alpha -> try Create32BitHICON once and restart this icon.
+            if(bpp==32){
+                if(!IsAlphaBitmap(hColor)){
+                    if(!didTemp){
+                        HICON hNew=Create32BitHICON(hIcon);
+                        if(hNew){
+                            tempIcons.push_back(hNew);
+                            hIcon=hNew;
+                            didTemp=true;
+                            DeleteObject(hMask);
+                            DeleteObject(hColor);
+                            continue; // retry
+                        }
+                    }
+                } else{
+                    // AutoIt compress condition: (colorSize >= 256*256*4) AND compress
+                    if(compressLargeImages&&colorSize>=(256u*256u*4u)){
+                        std::vector<BYTE> png=CompressBitmapToPng(hColor);
+                        if(!png.empty()){
+                            ICONDIRENTRY& e=entries[i];
+                            e.bWidth=(dsColor.dsBm.bmWidth<256)?(BYTE)dsColor.dsBm.bmWidth:0;
+                            e.bHeight=(dsColor.dsBm.bmHeight<256)?(BYTE)dsColor.dsBm.bmHeight:0;
+                            e.bColorCount=0;
+                            e.bReserved=0;
+                            e.wPlanes=1;
+                            e.wBitCount=32;
+                            e.dwBytesInRes=(DWORD)png.size();
+                            e.dwImageOffset=offset;
+
+                            if(!WriteAll(hFile,png.data(),(DWORD)png.size())){
+                                DeleteObject(hMask);
+                                DeleteObject(hColor);
+                                fail();
+                                return false;
+                            }
+                            offset+=(DWORD)png.size();
+
+                            DeleteObject(hMask);
+                            DeleteObject(hColor);
+                            break; // done with this icon
+                        }
+                    }
+                }
+            }
+
+            // Uncompressed path: BITMAPINFOHEADER + color (XOR) + mask (AND)
+            BITMAPINFOHEADER bih{};
+            bih.biSize=40;
+            bih.biWidth=dsColor.dsBm.bmWidth;
+            bih.biHeight=2*dsColor.dsBm.bmHeight;
+            bih.biPlanes=1;
+            bih.biBitCount=(WORD)bpp;
+            bih.biCompression=BI_RGB;
+            bih.biSizeImage=colorSize+maskSize;
+
+            ICONDIRENTRY& e=entries[i];
+            e.bWidth=(dsColor.dsBm.bmWidth<256)?(BYTE)dsColor.dsBm.bmWidth:0;
+            e.bHeight=(dsColor.dsBm.bmHeight<256)?(BYTE)dsColor.dsBm.bmHeight:0;
+            e.bColorCount=0;
+            e.bReserved=0;
+            e.wPlanes=1;
+            e.wBitCount=(WORD)bpp;
+            e.dwBytesInRes=40+colorSize+maskSize;
+            e.dwImageOffset=offset;
+
+            if(!WriteAll(hFile,&bih,40)||
+               !WriteAll(hFile,dsColor.dsBm.bmBits,colorSize)||
+               !WriteAll(hFile,dsMask.dsBm.bmBits,maskSize)){
+                DeleteObject(hMask);
+                DeleteObject(hColor);
+                fail();
+                return false;
+            }
+
+            offset+=40+colorSize+maskSize;
+
+            DeleteObject(hMask);
+            DeleteObject(hColor);
+            break;
+        }
+    }
+
+    // Seek back and write final header + dir entries (AutoIt does this)
+    SetFilePointer(hFile,0,nullptr,FILE_BEGIN);
+    if(!WriteAll(hFile,&hdr,sizeof(hdr))||
+       !WriteAll(hFile,entries.data(),(DWORD)(entries.size()*sizeof(ICONDIRENTRY)))){
+        for(HICON h:tempIcons) DestroyIcon(h);
+        CloseHandle(hFile);
+        DeleteFileW(filePath.c_str());
+        return false;
+    }
+
+    CloseHandle(hFile);
+    for(HICON h:tempIcons) DestroyIcon(h);
+    return true;
+}
+
+
 
 void ReaperThread(DWORD pid,std::wstring clientName,ProfileType type){
     HANDLE hProcess=OpenProcess(SYNCHRONIZE,FALSE,pid);
@@ -1399,17 +1762,17 @@ void ReaperThread(DWORD pid,std::wstring clientName,ProfileType type){
                 try{ fs::remove(backup7z); } catch(...){}
             }
             // Rebuild Default.7z from the cleaned Default profile folder (InProc7z).
-            CtSpaces7zUiCtx ctx;
+            _7zUiCtx ctx;
             ctx.mainWnd=g_hGui;
             ctx.status=L"Updating Default Profile...";
 
             ProgressUI_PostShow(ctx.mainWnd,ctx.status,-1);
 
-            HRESULT hr=Ct7zCompress7z(
+            HRESULT hr=_7zCompress7z(
                 backup7z.c_str(),
                 profilePath.c_str(),
                 false,
-                &CtSpaces7zProgress,
+                &_7zProgress,
                 &ctx
             );
 
@@ -1438,78 +1801,103 @@ void EnsureWatcherIsRunning(){
 }
 
 void WatcherThread(){
-    //static std::map<std::wstring,HICON> iconCache;
     while(true){
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
         std::map<std::wstring,DWORD> profiles_copy;
         {
             std::lock_guard<std::mutex> lock(g_activeProfilesMutex);
             if(g_activeProfiles.empty()){
                 g_isWatcherRunning=false;
-                for(auto const& [name,hIcon]:g_iconCache){
-                    if(hIcon) DestroyIcon(hIcon);
+
+                // free cache (all sizes)
+                std::lock_guard<std::mutex> cacheLock(g_iconCacheMutex);
+                for(auto& [name,set]:g_iconCache){
+                    for(auto& [px,hIcon]:set.byPx){
+                        if(hIcon) DestroyIcon(hIcon);
+                    }
                 }
                 g_iconCache.clear();
                 return;
             }
             profiles_copy=g_activeProfiles;
         }
+
         std::lock_guard<std::mutex> cacheLock(g_iconCacheMutex);
+
+        // prune cache entries for profiles no longer active
         for(auto it=g_iconCache.begin(); it!=g_iconCache.end(); ){
             if(profiles_copy.find(it->first)==profiles_copy.end()){
-                if(it->second) DestroyIcon(it->second);
+                for(auto& [px,hIcon]:it->second.byPx){
+                    if(hIcon) DestroyIcon(hIcon);
+                }
                 it=g_iconCache.erase(it);
             } else{
                 ++it;
             }
         }
+
         for(const auto& [clientName,pid]:profiles_copy){
-            if(g_iconCache.find(clientName)==g_iconCache.end()){
-                fs::path profilePath;
-                if(clientName==L"Temp") profilePath=g_sDataDir/"Temp";
-                else if(clientName==L"Default") profilePath=g_sDataDir/"Default";
-                else profilePath=g_sDataDir/"Sites"/clientName;
+            fs::path profilePath;
+            if(clientName==L"Temp") profilePath=g_sDataDir/"Temp";
+            else if(clientName==L"Default") profilePath=g_sDataDir/"Default";
+            else profilePath=g_sDataDir/"Sites"/clientName;
 
-                fs::path iconPath=profilePath/"client.ico";
-                HICON hIcon=NULL;
+            fs::path iconPath=profilePath/"client.ico";
+
+            auto& cacheSet=g_iconCache[clientName];
+
+            auto getIconPx=[&](int px)->HICON{
+                auto it=cacheSet.byPx.find(px);
+                if(it!=cacheSet.byPx.end()) return it->second;
+
+                HICON h=nullptr;
                 if(fs::exists(iconPath)){
-                    hIcon=(HICON)LoadImageW(NULL,iconPath.c_str(),IMAGE_ICON,0,0,LR_LOADFROMFILE|LR_DEFAULTSIZE|LR_SHARED);
+                    h=LoadIconFromIcoBestDownscale(iconPath,px); // next-highest then downscale
                 }
-                g_iconCache[clientName]=hIcon;
-            }
+                cacheSet.byPx[px]=h; // cache nullptr too
+                return h;
+            };
 
-            HICON hCurrentIcon=g_iconCache[clientName];
-
-            EnumData data={pid};
+            EnumData data{pid};
             EnumWindows(EnumWindowsCallback,(LPARAM)&data);
             if(data.windows.empty()) continue;
 
             std::wstring newTitlePartial=std::format(L" - {} - {}",clientName,APP_ALIAS);
 
-            for(HWND hWnd:data.windows){
-                if(hCurrentIcon){
-                    if((HICON)SendMessage(hWnd,WM_GETICON,ICON_SMALL,0)!=hCurrentIcon){
-                        SendMessage(hWnd,WM_SETICON,ICON_SMALL,(LPARAM)hCurrentIcon);
-                    }
-                    if((HICON)SendMessage(hWnd,WM_GETICON,ICON_BIG,0)!=hCurrentIcon){
-                        SendMessage(hWnd,WM_SETICON,ICON_BIG,(LPARAM)hCurrentIcon);
-                    }
+            for(HWND ew:data.windows){
+                const UINT dpi=GetDpiForWindow(ew);
+                const int pxSmall=GetSystemMetricsForDpi(SM_CXSMICON,dpi);
+                const int pxBig=GetSystemMetricsForDpi(SM_CXICON,dpi);
+
+                HICON hSmall=getIconPx(pxSmall);
+                HICON hBig=getIconPx(pxBig);
+
+                if(hSmall&&(HICON)SendMessage(ew,WM_GETICON,ICON_SMALL,0)!=hSmall){
+                    SendMessage(ew,WM_SETICON,ICON_SMALL,(LPARAM)hSmall);
                 }
+                if(hBig&&(HICON)SendMessage(ew,WM_GETICON,ICON_BIG,0)!=hBig){
+                    SendMessage(ew,WM_SETICON,ICON_BIG,(LPARAM)hBig);
+                }
+
                 wchar_t currentTitle[256];
-                GetWindowTextW(hWnd,currentTitle,256);
+                GetWindowTextW(ew,currentTitle,256);
                 std::wstring titleStr(currentTitle);
+
                 std::wregex expr(L"(.*) - Profile 1 - Microsoft.*Edge");
                 std::wsmatch match;
                 if(std::regex_match(titleStr,match,expr)&&match.size()>1){
                     std::wstring newTitle=match[1].str()+newTitlePartial;
-                    SetWindowTextW(hWnd,newTitle.c_str());
+                    SetWindowTextW(ew,newTitle.c_str());
                 }
+
                 std::wstring appId=std::format(L"ctSpaces.{}.Default",clientName);
-                SetWindowAppId(hWnd,appId);
+                SetWindowAppId(ew,appId);
             }
         }
     }
 }
+
 
 bool FindEdgePath(){
     std::vector<fs::path> searchPaths;
@@ -1688,6 +2076,7 @@ HWND CreateToolTip(HWND hwndTool,HWND hDlg,PTSTR pszText){
     toolInfo.uFlags=TTF_IDISHWND|TTF_SUBCLASS;
     toolInfo.uId=(UINT_PTR)hwndTool;
     toolInfo.lpszText=pszText;
+    SendMessageW(hwndTip,WM_SETFONT,(WPARAM)g_hFont,TRUE);
     SendMessage(hwndTip,TTM_ADDTOOL,0,(LPARAM)&toolInfo);
     return hwndTip;
 }
@@ -1785,3 +2174,760 @@ inline void FocusClientEdit(){
     }
 }
 
+static INT_PTR CALLBACK AboutDlgProc(HWND hDlg,UINT msg,WPARAM wParam,LPARAM lParam){
+    switch(msg){
+    case WM_INITDIALOG: {
+        const UINT dpi=GetDpiForWindow(hDlg);
+
+        // Title
+        std::wstring title=std::format(L"About");
+        SetWindowTextW(hDlg,title.c_str());
+
+        // Hide ALL existing resource children except OK/CANCEL
+        EnumChildWindows(hDlg,[](HWND c,LPARAM)->BOOL{
+            int id=GetDlgCtrlID(c);
+            if(id!=IDOK&&id!=IDCANCEL) ShowWindow(c,SW_HIDE);
+            return TRUE;
+        },0);
+
+        // Dialog icons (caption)
+        const int sm=GetSystemMetricsForDpi(SM_CXSMICON,dpi);
+        const int bg=GetSystemMetricsForDpi(SM_CXICON,dpi);
+        g_hAboutDlgSmall=LoadIconResBestDownscale(g_hInst,IDI_CTSPACES,sm,sm);
+        g_hAboutDlgBig=LoadIconResBestDownscale(g_hInst,IDI_CTSPACES,bg,bg);
+        int iw,ih;
+        if(GetIconSizePx(g_hAboutDlgSmall,iw,ih)){
+            wchar_t b[128];
+            wsprintfW(b,L"AboutDlgSmall size = %dx%d\n",iw,ih);
+            OutputDebugStringW(b);
+        }
+
+        g_hAboutDlgSmall=LoadIcon(g_hInst,MAKEINTRESOURCE(IDI_CTSPACES));
+        g_hAboutDlgSmall=LoadIcon(g_hInst,MAKEINTRESOURCE(IDI_CTSPACES));
+        if(g_hAboutDlgSmall) SendMessageW(hDlg,WM_SETICON,ICON_SMALL,(LPARAM)g_hAboutDlgSmall);
+        if(g_hAboutDlgBig)   SendMessageW(hDlg,WM_SETICON,ICON_BIG,(LPARAM)g_hAboutDlgBig);
+
+        // Layout
+        const int margin=MulDiv(12,dpi,96);
+        const int gap=MulDiv(8,dpi,96);
+        const int iconPx=MulDiv(64,dpi,96);
+
+        // Load 64px icon for content area
+        g_hAboutIcon64=LoadIconResBestDownscale(g_hInst,IDI_IRND,iconPx,iconPx);
+        
+        // Resize dialog to fit (bigger than the stock one)
+        const int dlgW=MulDiv(480,dpi,96);
+        const int dlgH=MulDiv(192,dpi,96);
+        SetWindowPos(hDlg,nullptr,0,0,dlgW,dlgH,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
+
+        RECT rc{};
+        GetClientRect(hDlg,&rc);
+
+        // Create our content controls
+        const int xIco=margin;
+        const int yTop=margin;
+
+        HWND hIco=CreateWindowW(L"STATIC",L"",WS_CHILD|WS_VISIBLE|SS_ICON,
+                                xIco,yTop,iconPx,iconPx,
+                                hDlg,(HMENU)1001,g_hInst,nullptr);
+        if(hIco&&g_hAboutIcon64){
+            SendMessageW(hIco,STM_SETIMAGE,IMAGE_ICON,(LPARAM)g_hAboutIcon64);
+        }
+
+        const int xText=xIco+iconPx+margin;
+        const int wText=rc.right-xText-margin;
+
+        HWND hTitle=CreateWindowW(L"STATIC",APP_TITLE.c_str(),
+                                  WS_CHILD|WS_VISIBLE|SS_LEFT|SS_NOPREFIX,
+                                  xText,yTop,wText,MulDiv(24,dpi,96),
+                                  hDlg,(HMENU)1002,g_hInst,nullptr);
+
+        HWND hBy=CreateWindowW(L"STATIC",L"by BiatuAutMiahn",
+                               WS_CHILD|WS_VISIBLE|SS_LEFT|SS_NOPREFIX,
+                               xText+MulDiv(16,dpi,96),yTop+MulDiv(20,dpi,96),wText,MulDiv(20,dpi,96),
+                               hDlg,(HMENU)1003,g_hInst,nullptr);
+
+        // Use SysLink so the URL is clickable (needs comctl32 v6, which you have)
+        const wchar_t* linkText=
+            L"<a href=\"https://github.com/BiatuAutMiahn/ctSpaces\">https://github.com/BiatuAutMiahn/ctSpaces</a>";
+
+        HWND hLink=CreateWindowW(WC_LINK,linkText,
+                                 WS_CHILD|WS_VISIBLE|WS_TABSTOP,
+                                 xText,yTop+MulDiv(36,dpi,96),rc.right-margin*2,MulDiv(24,dpi,96),
+                                 hDlg,(HMENU)1004,g_hInst,nullptr);
+
+        const wchar_t* thanksText=
+            L"Thanks:\r\n"
+            L"  Igor Pavlov (7-Zip)\r\n"
+            L"  OpenAI (R&D and rapid prototyping)\r\n"
+            L"  Google (Material Icons)";
+
+        HWND hThanks=CreateWindowW(L"STATIC",thanksText,
+                                   WS_CHILD|WS_VISIBLE|SS_LEFT|SS_NOPREFIX,
+                                   xText,yTop+MulDiv(68,dpi,96),MulDiv(256,dpi,96),MulDiv(80,dpi,96),
+                                   hDlg,(HMENU)1005,g_hInst,nullptr);
+
+        // OK button: keep its size, move to bottom-right
+        HWND hOk=GetDlgItem(hDlg,IDOK);
+        if(hOk){
+            RECT br{};
+            GetWindowRect(hOk,&br);
+            const int bw=br.right-br.left;
+            const int bh=br.bottom-br.top;
+            MoveWindow(hOk,rc.right-margin-bw,rc.bottom-margin-bh,bw,bh,TRUE);
+            SendMessageW(hOk,WM_SETFONT,(WPARAM)g_hFont,TRUE);
+        }
+
+
+        // Fonts
+        if(hThanks) SendMessageW(hThanks,WM_SETFONT,(WPARAM)g_hFont,TRUE);
+        if(hTitle) SendMessageW(hTitle,WM_SETFONT,(WPARAM)g_hFont,TRUE);
+        if(hBy)    SendMessageW(hBy,WM_SETFONT,(WPARAM)GetAboutSmallFont(),TRUE);
+        if(hLink)  SendMessageW(hLink,WM_SETFONT,(WPARAM)g_hFont,TRUE);
+
+        return (INT_PTR)TRUE;
+    }
+
+    case WM_NOTIFY: {
+        NMHDR* nm=(NMHDR*)lParam;
+        if(!nm) break;
+
+        if((nm->code==NM_CLICK||nm->code==NM_RETURN)&&nm->idFrom==1004){
+            auto* link=(NMLINK*)lParam;
+            if(link) ShellExecuteW(hDlg,L"open",link->item.szUrl,nullptr,nullptr,SW_SHOWNORMAL);
+            return (INT_PTR)TRUE;
+        }
+        break;
+    }
+
+    case WM_COMMAND:
+        if(LOWORD(wParam)==IDOK||LOWORD(wParam)==IDCANCEL){
+            EndDialog(hDlg,LOWORD(wParam));
+            return (INT_PTR)TRUE;
+        }
+        break;
+
+    case WM_DESTROY:
+        if(g_hAboutIcon64){ DestroyIcon(g_hAboutIcon64);    g_hAboutIcon64=nullptr; }
+        if(g_hAboutDlgSmall){ DestroyIcon(g_hAboutDlgSmall);  g_hAboutDlgSmall=nullptr; }
+        if(g_hAboutDlgBig){ DestroyIcon(g_hAboutDlgBig);    g_hAboutDlgBig=nullptr; }
+        break;
+    }
+    return (INT_PTR)FALSE;
+}
+
+
+static void ShowAboutDialog(){
+    // Ensure the dialog is created under the same DPI awareness context as the main window.
+    DPI_AWARENESS_CONTEXT parentCtx=GetWindowDpiAwarenessContext(g_hGui);
+    DPI_AWARENESS_CONTEXT oldCtx=SetThreadDpiAwarenessContext(parentCtx);
+
+    DialogBoxW(g_hInst,MAKEINTRESOURCEW(IDD_ABOUTBOX),g_hGui,AboutDlgProc);
+
+    SetThreadDpiAwarenessContext(oldCtx);
+    //DialogBoxW(g_hInst,MAKEINTRESOURCEW(IDD_ABOUTBOX),g_hGui,AboutDlgProc);
+}
+static HBITMAP IconToMenuBitmap(HICON hIcon,int cx,int cy){
+    if(!hIcon) return nullptr;
+
+    BITMAPINFO bmi{};
+    bmi.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth=cx;
+    bmi.bmiHeader.biHeight=-cy; // top-down DIB
+    bmi.bmiHeader.biPlanes=1;
+    bmi.bmiHeader.biBitCount=32;
+    bmi.bmiHeader.biCompression=BI_RGB;
+
+    void* bits=nullptr;
+    HDC hdc=GetDC(nullptr);
+    HBITMAP hbmp=CreateDIBSection(hdc,&bmi,DIB_RGB_COLORS,&bits,nullptr,0);
+    ReleaseDC(nullptr,hdc);
+    if(!hbmp||!bits) return nullptr;
+
+    ZeroMemory(bits,(size_t)cx*(size_t)cy*4);
+
+    HDC memDC=CreateCompatibleDC(nullptr);
+    HGDIOBJ old=SelectObject(memDC,hbmp);
+    DrawIconEx(memDC,0,0,hIcon,cx,cy,0,nullptr,DI_NORMAL);
+    SelectObject(memDC,old);
+    DeleteDC(memDC);
+
+    return hbmp;
+}
+
+static HICON LoadIconResSized(int iconResId,int cx,int cy){
+    return (HICON)LoadImageW(g_hInst,MAKEINTRESOURCEW(iconResId),IMAGE_ICON,cx,cy,LR_DEFAULTCOLOR);
+}
+
+static HICON LoadIconResScaled(int iconResId,int cx,int cy){
+    HICON h=nullptr;
+    if(SUCCEEDED(LoadIconWithScaleDown(g_hInst,MAKEINTRESOURCEW(iconResId),cx,cy,&h))&&h)
+        return h;
+    return (HICON)LoadImageW(
+        g_hInst,
+        MAKEINTRESOURCEW(iconResId),
+        IMAGE_ICON,
+        cx,cy,
+        LR_DEFAULTCOLOR
+    );
+}
+
+
+static void MenuAddItemBmp(HMENU hMenu,UINT id,const wchar_t* text,HBITMAP hbmp){
+    MENUITEMINFOW mi{};
+    mi.cbSize=sizeof(mi);
+    mi.fMask=MIIM_ID|MIIM_STRING|MIIM_BITMAP;
+    mi.wID=id;
+    mi.dwTypeData=const_cast<wchar_t*>(text);
+    mi.hbmpItem=hbmp;
+    InsertMenuItemW(hMenu,(UINT)-1,TRUE,&mi);
+}
+
+static void MenuAddSep(HMENU hMenu){
+    MENUITEMINFOW mi{};
+    mi.cbSize=sizeof(mi);
+    mi.fMask=MIIM_FTYPE;
+    mi.fType=MFT_SEPARATOR;
+    InsertMenuItemW(hMenu,(UINT)-1,TRUE,&mi);
+}
+static void EnsureConfigMenu(HWND hWnd){
+    if(g_hConfigMenu) return;
+
+    g_hConfigMenu=CreatePopupMenu();
+
+    const UINT dpi=GetDpiForWindow(hWnd);
+
+    // pick a logical size you like for menu icons
+    const int iconPx=MulDiv(28,dpi,96);      // <- change 18 to 16/20/24 etc.
+    //const int iconCx=GetSystemMetricsForDpi(SM_CXMENUCHECK,dpi);
+    //const int iconCy=GetSystemMetricsForDpi(SM_CYMENUCHECK,dpi);
+
+    const int rowPad=MulDiv(2,dpi,96);
+
+    MENUINFO mnuInfo{};
+    mnuInfo.cbSize=sizeof(mnuInfo);
+    mnuInfo.fMask=MIM_STYLE;
+    mnuInfo.dwStyle=MNS_CHECKORBMP;
+    SetMenuInfo(g_hConfigMenu,&mnuInfo);
+
+    auto mkbmp=[&](int iconResId) -> HBITMAP{
+        HBITMAP b=LoadMenuBitmapFromIconRes(iconResId,dpi,iconPx,iconPx);
+        g_menuBitmaps.push_back(b);
+        return b;
+    };
+
+    MenuAddItemBmp(g_hConfigMenu,IDM_CTX_SET_PROFILE_ICON,L"Set Profile Icon",mkbmp(IDI_AICOB));
+    MenuAddItemBmp(g_hConfigMenu,IDM_CTX_REFRESH_PROFILE,L"Refresh Profile",mkbmp(IDI_UPRFB));
+    MenuAddItemBmp(g_hConfigMenu,IDM_CTX_RESET_PROFILE,L"Reset Profile",mkbmp(IDI_RPRFB));
+    MenuAddItemBmp(g_hConfigMenu,IDM_CTX_DELETE_PROFILE,L"Delete Profile",mkbmp(IDI_DPRFB));
+    MenuAddSep(g_hConfigMenu);
+    MenuAddItemBmp(g_hConfigMenu,IDM_CTX_EDIT_DEFAULT_PROFILE,L"Edit Default profile",mkbmp(IDI_EDPFB));
+    MenuAddSep(g_hConfigMenu);
+    MenuAddItemBmp(g_hConfigMenu,IDM_ABOUT,L"About",mkbmp(IDI_INFOB));
+}
+
+
+static UINT ShowConfigMenuFromButton(HWND hWnd){
+    EnsureConfigMenu(hWnd);
+    UpdateConfigMenuEnabledState();
+    HideMenuTooltip();            
+    RECT rc{};
+    GetWindowRect(g_hBtnConfig,&rc);
+
+    SetForegroundWindow(hWnd);
+
+    UINT cmd=TrackPopupMenuEx(
+        g_hConfigMenu,
+        TPM_LEFTALIGN|TPM_TOPALIGN|TPM_RETURNCMD,
+        rc.left,
+        rc.bottom,
+        hWnd,
+        nullptr
+    );
+    HideMenuTooltip();
+    PostMessageW(hWnd,WM_NULL,0,0); // allow menu to dismiss cleanly
+    return cmd;
+}
+
+static void SetButtonIcon(HWND hBtn,int iconResId,HICON& hStore){
+    if(!hBtn) return;
+
+    RECT rc{};
+    GetClientRect(hBtn,&rc);
+
+    const int w=rc.right-rc.left;
+    const int h=rc.bottom-rc.top;
+
+    const UINT dpi=GetDpiForWindow(hBtn);
+    const int pad=MulDiv(2,dpi,96);
+    const int s=max(16,min(w,h)-pad); // requested size
+
+    HICON hNew=LoadIconResBestDownscale(g_hInst,iconResId,s,s);
+    
+    if(!hNew) return;
+
+    if(hStore){
+        DestroyIcon(hStore);
+        hStore=nullptr;
+    }
+    hStore=hNew;
+
+    SendMessageW(hBtn,BM_SETIMAGE,IMAGE_ICON,(LPARAM)hStore);
+}
+
+
+static HBITMAP LoadMenuBitmapFromIconRes(int iconResId,UINT /*dpi*/,int cx,int cy){
+    HICON hIcon=LoadIconResBestDownscale(g_hInst,iconResId,cx,cy);
+    HBITMAP hbmp=IconToMenuBitmap(hIcon,cx,cy);
+    if(hIcon) DestroyIcon(hIcon);
+    return hbmp;
+}
+
+static bool GetIconSizePx(HICON hIcon,int& w,int& h){
+    w=h=0;
+    ICONINFO ii{};
+    if(!GetIconInfo(hIcon,&ii)) return false;
+
+    BITMAP bm{};
+    bool ok=false;
+    if(ii.hbmColor&&GetObject(ii.hbmColor,sizeof(bm),&bm)==sizeof(bm)){
+        w=bm.bmWidth; h=bm.bmHeight; ok=true;
+    } else if(ii.hbmMask&&GetObject(ii.hbmMask,sizeof(bm),&bm)==sizeof(bm)){
+        w=bm.bmWidth; h=bm.bmHeight/2; ok=true;
+    }
+
+    if(ii.hbmColor) DeleteObject(ii.hbmColor);
+    if(ii.hbmMask)  DeleteObject(ii.hbmMask);
+    return ok;
+}
+
+static HICON LoadIconResBestDownscale(HINSTANCE hInst,int groupIconResId,int cxDesired,int cyDesired){
+    const int want=max(cxDesired,cyDesired);
+    if(want<=0) return nullptr;
+
+    HRSRC hGrpRes=FindResourceW(hInst,MAKEINTRESOURCEW(groupIconResId),RT_GROUP_ICON);
+    if(!hGrpRes) return nullptr;
+
+    HGLOBAL hGrp=LoadResource(hInst,hGrpRes);
+    if(!hGrp) return nullptr;
+
+    const auto* grp=(const GRPICONDIR*)LockResource(hGrp);
+    if(!grp||grp->idReserved!=0||grp->idType!=1||grp->idCount==0) return nullptr;
+
+    const GRPICONDIRENTRY* bestGE=nullptr;
+    int bestGES=(std::numeric_limits<int>::max)();
+
+    const GRPICONDIRENTRY* bestBig=nullptr;
+    int bestBigS=0;
+
+    for(int i=0;i<(int)grp->idCount;i++){
+        const auto& e=grp->idEntries[i];
+        const int s=max(IcoDim(e.bWidth),IcoDim(e.bHeight));
+
+        if(s>=want&&s<bestGES){
+            bestGES=s;
+            bestGE=&e;
+        }
+        if(s>bestBigS){
+            bestBigS=s;
+            bestBig=&e;
+        }
+    }
+
+    const GRPICONDIRENTRY* pick=bestGE?bestGE:bestBig;
+    if(!pick) return nullptr;
+
+    const int src=max(IcoDim(pick->bWidth),IcoDim(pick->bHeight));
+
+    HRSRC hIconRes=FindResourceW(hInst,MAKEINTRESOURCEW(pick->nID),RT_ICON);
+    if(!hIconRes) return nullptr;
+
+    DWORD cb=SizeofResource(hInst,hIconRes);
+    HGLOBAL hBits=LoadResource(hInst,hIconRes);
+    if(!hBits||cb==0) return nullptr;
+
+    BYTE* pBits=(BYTE*)LockResource(hBits);
+    if(!pBits) return nullptr;
+
+    // IMPORTANT: create at native size (0,0) so we do NOT let this API resample.
+    HICON hNative=CreateIconFromResourceEx(
+        pBits,cb,TRUE,0x00030000,
+        0,0,LR_DEFAULTCOLOR
+    );
+    if(!hNative) return nullptr;
+
+    // If exact match (or smaller-only), return as-is (no upscale).
+    if(src<=want) return hNative;
+
+    // Downscale only.
+    HICON hScaled=(HICON)CopyImage(hNative,IMAGE_ICON,want,want,0);
+    if(!hScaled){
+        hScaled=ScaleIconDown_HQ(hNative,want,want); // your GDI+ fallback
+    }
+    DestroyIcon(hNative);
+    return hScaled;
+}
+
+static HICON LoadIconFromIcoBestDownscale(const fs::path& icoPath,int pxDesired){
+    if(pxDesired<=0) return nullptr;
+
+    std::ifstream f(icoPath,std::ios::binary|std::ios::ate);
+    if(!f) return nullptr;
+
+    const std::streamsize sz=f.tellg();
+    if(sz<(std::streamsize)sizeof(ICONDIRHDR)) return nullptr;
+    f.seekg(0,std::ios::beg);
+
+    std::vector<BYTE> buf((size_t)sz);
+    if(!f.read((char*)buf.data(),sz)) return nullptr;
+
+    const auto* hdr=(const ICONDIRHDR*)buf.data();
+    if(hdr->idReserved!=0||hdr->idType!=1||hdr->idCount==0) return nullptr;
+
+    const size_t need=sizeof(ICONDIRHDR)+(size_t)hdr->idCount*sizeof(ICONDIRENTRY);
+    if(buf.size()<need) return nullptr;
+
+    const auto* ents=(const ICONDIRENTRY*)(buf.data()+sizeof(ICONDIRHDR));
+
+    const int want=pxDesired;
+
+    const ICONDIRENTRY* bestGE=nullptr;
+    int bestGES=(std::numeric_limits<int>::max)();
+
+    const ICONDIRENTRY* bestBig=nullptr;
+    int bestBigS=0;
+
+    for(int i=0;i<(int)hdr->idCount;i++){
+        const auto& e=ents[i];
+        int s=max(IcoDim(e.bWidth),IcoDim(e.bHeight));
+
+        if(s>=want&&s<bestGES){
+            bestGES=s;
+            bestGE=&e;
+        }
+        if(s>bestBigS){
+            bestBigS=s;
+            bestBig=&e;
+        }
+    }
+
+    const ICONDIRENTRY* pick=bestGE?bestGE:bestBig;
+    if(!pick) return nullptr;
+
+    const size_t off=(size_t)pick->dwImageOffset;
+    const size_t cb=(size_t)pick->dwBytesInRes;
+    if(off>=buf.size()||cb==0||off+cb>buf.size()) return nullptr;
+
+    const int src=max(IcoDim(pick->bWidth),IcoDim(pick->bHeight));
+    const int out=min(pxDesired,src); // never upscale
+
+    BYTE* pBits=buf.data()+off;
+
+    return CreateIconFromResourceEx(
+        pBits,
+        (DWORD)cb,
+        TRUE,
+        0x00030000,
+        out,out,
+        LR_DEFAULTCOLOR
+    );
+}
+
+
+static HFONT CreateSmallerFontFrom(HFONT baseFont,int pxHeight,UINT dpi){
+    LOGFONTW lf{};
+    if(baseFont&&GetObjectW(baseFont,sizeof(lf),&lf)==sizeof(lf)){
+        lf.lfHeight=-MulDiv(pxHeight,dpi,96); // negative = character height
+        return CreateFontIndirectW(&lf);
+    }
+    // fallback
+    return CreateFontW(
+        -MulDiv(pxHeight,dpi,96),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,
+        DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,DEFAULT_QUALITY,
+        DEFAULT_PITCH|FF_MODERN,L"Consolas"
+    );
+}
+
+
+static HICON ScaleIconDown_HQ(HICON hSrc,int dstCx,int dstCy){
+    if(!hSrc||dstCx<=0||dstCy<=0) return nullptr;
+
+    Gdiplus::Bitmap src(hSrc);
+    if(src.GetLastStatus()!=Gdiplus::Ok) return nullptr;
+
+    const UINT srcW=src.GetWidth(),srcH=src.GetHeight();
+    if((UINT)dstCx>=srcW&&(UINT)dstCy>=srcH) return CopyIcon(hSrc);
+
+    Gdiplus::Bitmap dst(dstCx,dstCy,PixelFormat32bppARGB);
+    if(dst.GetLastStatus()!=Gdiplus::Ok) return nullptr;
+
+    Gdiplus::Graphics g(&dst);
+    g.SetCompositingMode(Gdiplus::CompositingModeSourceCopy);
+    g.SetCompositingQuality(Gdiplus::CompositingQualityHighQuality);
+    g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
+    g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+
+    g.Clear(Gdiplus::Color(0,0,0,0));
+    g.DrawImage(&src,Gdiplus::Rect(0,0,dstCx,dstCy));
+
+    HICON hOut=nullptr;
+    if(dst.GetHICON(&hOut)!=Gdiplus::Ok) return nullptr;
+    return hOut;
+}
+
+static fs::path GetProfileDirFromName(const std::wstring& name){
+    if(_wcsicmp(name.c_str(),L"Temp")==0)    return g_sDataDir/"Temp";
+    if(_wcsicmp(name.c_str(),L"Default")==0) return g_sDataDir/"Default";
+    return g_sDataDir/"Sites"/name;
+}
+
+static void UpdateIconPreviewForSelection(bool preferListSelection){
+    if(!g_hIconPreview) return;
+
+    const UINT dpi=GetDpiForWindow(g_hIconPreview);
+    const int px=MulDiv(32,dpi,96);
+
+    std::wstring name=GetSelectedClientNameSanitized(preferListSelection);
+
+
+    HICON hNew=nullptr;
+    if(!name.empty()){
+        fs::path icoPath=GetProfileDirFromName(name)/"client.ico";
+        if(fs::exists(icoPath)){
+            hNew=LoadIconFromIcoBestDownscale(icoPath,px);
+        }
+    }
+    if(!hNew){
+        hNew=LoadIconResBestDownscale(g_hInst,IDI_NIMGB,px,px);
+    }
+
+    HICON hOld=(HICON)SendMessageW(g_hIconPreview,STM_SETIMAGE,IMAGE_ICON,(LPARAM)hNew);
+    if(hOld&&hOld!=hNew) DestroyIcon(hOld);
+
+    g_hIconPreviewHandle=hNew;
+}
+
+
+static void EnsureMenuTooltips(HWND hWnd){
+    if(g_hMenuTip) return;
+
+    g_hMenuTip=CreateWindowExW(
+        WS_EX_TOPMOST,
+        TOOLTIPS_CLASSW,
+        nullptr,
+        TTS_ALWAYSTIP|TTS_NOPREFIX|TTS_BALLOON,
+        CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,
+        hWnd,nullptr,g_hInst,nullptr
+    );
+
+    if(!g_hMenuTip) return;
+
+    SetWindowPos(g_hMenuTip,HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+    SendMessageW(g_hMenuTip,TTM_SETMAXTIPWIDTH,0,450);
+    SendMessageW(g_hMenuTip,WM_SETFONT,(WPARAM)g_hFont,TRUE);
+
+    ZeroMemory(&g_menuTi,sizeof(g_menuTi));
+    g_menuTi.cbSize=sizeof(g_menuTi);
+    g_menuTi.uFlags=TTF_TRACK|TTF_ABSOLUTE|TTF_TRANSPARENT;
+    g_menuTi.hwnd=hWnd;
+    g_menuTi.uId=1;
+    g_menuTi.lpszText=(LPWSTR)L"";
+    SendMessageW(g_hMenuTip,TTM_ADDTOOL,0,(LPARAM)&g_menuTi);
+
+    // Tooltip text per menu item
+    g_menuTipText.clear();
+    g_menuTipText[IDM_CTX_SET_PROFILE_ICON]=L"Choose an icon/image for profile.";
+    g_menuTipText[IDM_CTX_REFRESH_PROFILE]=L"Rebuild this profile from Default.7z (Extract/Replace)";
+    g_menuTipText[IDM_CTX_RESET_PROFILE]=L"Delete this profile and recreate from Default.7z.";
+    g_menuTipText[IDM_CTX_DELETE_PROFILE]=L"Permanently delete this profile folder.";
+    g_menuTipText[IDM_CTX_EDIT_DEFAULT_PROFILE]=L"Open the Default profile for editing.";
+    g_menuTipText[IDM_ABOUT]=L"About ctSpaces";
+}
+
+static void HideMenuTooltip(){
+    if(!g_hMenuTip) return;
+    SendMessageW(g_hMenuTip,TTM_TRACKACTIVATE,FALSE,(LPARAM)&g_menuTi);
+}
+
+static void HandleMenuSelect(HWND hWnd,WPARAM wParam,LPARAM lParam){
+    // Menu closing / no selection
+    const UINT item=(UINT)LOWORD(wParam);
+    const UINT flags=(UINT)HIWORD(wParam);
+
+    if(item==0xFFFF||lParam==0){
+        HideMenuTooltip();
+        return;
+    }
+
+    // Popup highlight gives index, not command id
+    if(flags&MF_POPUP){
+        HideMenuTooltip();
+        return;
+    }
+
+    auto it=g_menuTipText.find(item);
+    if(it==g_menuTipText.end()){
+        HideMenuTooltip();
+        return;
+    }
+
+    // Don't show tooltip for disabled items
+    if((flags&MF_DISABLED)||(flags&MF_GRAYED)){
+        HideMenuTooltip();
+        return;
+    }
+
+    // Show near cursor
+    POINT pt{};
+    GetCursorPos(&pt);
+
+    g_menuTi.lpszText=(LPWSTR)it->second.c_str();
+    SendMessageW(g_hMenuTip,TTM_UPDATETIPTEXTW,0,(LPARAM)&g_menuTi);
+    SendMessageW(g_hMenuTip,TTM_TRACKPOSITION,0,MAKELPARAM(pt.x+12,pt.y+18));
+    SendMessageW(g_hMenuTip,TTM_TRACKACTIVATE,TRUE,(LPARAM)&g_menuTi);
+}
+
+static void UpdateConfigMenuEnabledState(){
+    if(!g_hConfigMenu) return;
+
+    std::wstring name=GetSelectedClientNameSanitized(false);
+    const bool hasSelection=!name.empty();
+
+    auto en=[&](UINT id,bool enabled){
+        EnableMenuItem(
+            g_hConfigMenu,
+            id,
+            MF_BYCOMMAND|(enabled?MF_ENABLED:(MF_DISABLED|MF_GRAYED))
+        );
+    };
+
+    // Disable everything requiring a selection when empty; ALWAYS allow Default/About
+    en(IDM_CTX_SET_PROFILE_ICON,hasSelection);
+    en(IDM_CTX_REFRESH_PROFILE,hasSelection);
+    en(IDM_CTX_RESET_PROFILE,hasSelection);
+    en(IDM_CTX_DELETE_PROFILE,hasSelection);
+
+    en(IDM_CTX_EDIT_DEFAULT_PROFILE,true);
+    en(IDM_ABOUT,true);
+}
+static void LayoutMainGui(HWND hWnd){
+    if(!hWnd) return;
+
+    const UINT dpi=GetDpiForWindow(hWnd);
+
+
+
+    const int m=MulDiv(8,dpi,96);
+    const int labelH=MulDiv(16,dpi,96);
+    const int comboVisH=MulDiv(24,dpi,96);
+    const int comboDropH=MulDiv(220,dpi,96);
+
+    const int btnSmall=MulDiv(28,dpi,96);
+
+    // Icon target size (32 DIP)
+    const int iconPx=MulDiv(32,dpi,96);
+
+    // EXACT: 2px margin around icon inside groupbox
+    const int iconPad=MulDiv(6,dpi,96);
+
+    // Label: 4px from top-left, and -2px vertical (overlap border like a caption)
+    const int lblOffX=MulDiv(2,dpi,96);
+    const int lblOffY=MulDiv(1,dpi,96);
+    const int lblH=MulDiv(14,dpi,96);
+    const int lblRise=MulDiv(2,dpi,96); // "Icon label should be -2px"
+
+    // Tight groupbox: label + pad + icon + pad
+    const int grpW=iconPx+iconPad*2;
+    const int grpH=(lblOffY+lblH+iconPad+iconPx+iconPad)-MulDiv(6,dpi,96);
+
+    RECT rc{};
+    GetClientRect(hWnd,&rc);
+    const int W=rc.right-rc.left;
+    const int H=rc.bottom-rc.top;
+
+    // Prompt + combo (top area)
+    HWND hPrompt=GetDlgItem(hWnd,IDC_STATIC_PROMPT);
+
+    int x=m;
+    int y=m;
+    int w=W-2*m;
+
+    if(hPrompt) MoveWindow(hPrompt,x,y,w,labelH,TRUE);
+    y+=labelH+m;
+
+    MoveWindow(g_hComboClient,x,y,w,comboDropH,TRUE);
+
+    // --- Bottom row anchored to window bottom (match ORIGINAL small buttons) ---
+    const int bm=MulDiv(4,dpi,96);          // original iGuiM = 4
+    const int yBottom=H-bm;
+
+    // Groupbox top so its bottom sits at (H - m)
+    const int yRow=yBottom-grpH;
+
+    // Right buttons anchored to bottom-right with bm margin + bm spacing (original behavior)
+    const int xCfg=W-bm-btnSmall;
+    const int xTmp=xCfg-bm-btnSmall+MulDiv(2,dpi,96);
+    const int yBtn=H-bm-btnSmall;
+
+    const int grpX=bm;
+
+    MoveWindow(g_hGrpIcon,grpX,yRow,grpW,grpH,TRUE);
+
+    MoveWindow(
+        g_hLblIcon,
+        grpX+lblOffX,
+        yRow+lblOffY-lblRise,
+        grpW-lblOffX-iconPad-MulDiv(6,dpi,96),
+        lblH,
+        TRUE
+    );
+
+    const int xIco=grpX+iconPad;
+    const int yIco=yRow+lblOffY+lblH+iconPad-MulDiv(6,dpi,96);
+    MoveWindow(g_hIconPreview,xIco,yIco,iconPx,iconPx,TRUE);
+
+    // Right buttons
+    MoveWindow(g_hBtnTmpProf,xTmp,yBtn,btnSmall,btnSmall,TRUE);
+    MoveWindow(g_hBtnConfig,xCfg,yBtn,btnSmall,btnSmall,TRUE);
+
+
+    // --- Go centered/aligned with the combo (horizontal centerline of combo area) ---
+    const int leftEdge=x+grpW+m;
+    const int rightEdge=xTmp-m;
+    const int avail=max(0,rightEdge-leftEdge);
+
+    const int goW=MulDiv(64,dpi,96);
+    const int goH=MulDiv(44,dpi,96);
+
+    // Centered on the same horizontal centerline as the combo/content
+    const int goX = x + (w - goW) / 2;
+
+    // Under the visible combo height (like the original UI flow)
+    const int goY=y+comboVisH+m;//+MulDiv(8,dpi,96);
+
+    MoveWindow(g_hBtnGo, goX, goY, goW, goH, TRUE);
+}
+
+static std::wstring GetSelectedClientNameSanitized(bool preferListSelection){
+    // Edit text (what the user typed)
+    wchar_t editBuf[256]{};
+    GetWindowTextW(g_hComboClient,editBuf,256);
+    std::wstring editName=SanitizeName(editBuf);
+
+    // Current list selection (what the dropdown is on)
+    wchar_t selBuf[256]{};
+    std::wstring selName;
+    int sel=(int)SendMessageW(g_hComboClient,CB_GETCURSEL,0,0);
+    if(sel!=CB_ERR){
+        SendMessageW(g_hComboClient,CB_GETLBTEXT,sel,(LPARAM)selBuf);
+        selName=SanitizeName(selBuf);
+    }
+
+    // If caller wants list selection, use it when available
+    if(preferListSelection&&!selName.empty()) return selName;
+
+    // Otherwise prefer what the user typed, fallback to selection
+    if(!editName.empty()) return editName;
+    return selName; // may be empty
+}
