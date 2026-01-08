@@ -111,12 +111,15 @@ HINSTANCE g_hInst;
 HWND g_hGui=NULL;
 HWND g_hComboClient=NULL;
 HWND g_hValidationTooltip=NULL;
+HWND g_hBtnTmpProfTip=NULL;
+HWND g_hBtnConfigTip=NULL;
 HWND g_hBtnGo=NULL;
 HWND g_hBtnTmpProf=NULL;
 HWND g_hBtnConfig=NULL;
 HMENU g_hConfigMenu=nullptr;
 std::vector<HBITMAP> g_menuBitmaps; // owned; freed on WM_DESTROY
 HFONT g_hFont=NULL;
+static UINT g_uiDpi=USER_DEFAULT_SCREEN_DPI;
 fs::path g_sDataDir;
 fs::path g_sEdgePath;
 std::wstring g_sLastValidComboText=L"";
@@ -167,6 +170,7 @@ static std::map<UINT,std::wstring> g_menuTipText; // menu id -> tooltip text
 
 
 static HFONT g_hFontAboutSmall=nullptr;
+static HFONT g_hAboutFont=nullptr;
 static HICON g_hAboutIcon64=nullptr;
 static HICON g_hAboutDlgSmall=nullptr;
 static HICON g_hAboutDlgBig=nullptr;
@@ -174,10 +178,142 @@ static HICON g_hAboutDlgBig=nullptr;
 static HFONT GetAboutSmallFont(){
     if(g_hFontAboutSmall) return g_hFontAboutSmall;
     LOGFONTW lf{};
-    GetObjectW(g_hFont,sizeof(lf),&lf);
-    lf.lfHeight=(lf.lfHeight*85)/100; // smaller
-    g_hFontAboutSmall=CreateFontIndirectW(&lf);
+    HFONT base=g_hAboutFont?g_hAboutFont:g_hFont;
+    if(base&&GetObjectW(base,sizeof(lf),&lf)==sizeof(lf)){
+        lf.lfHeight=(lf.lfHeight*85)/100; // smaller
+        g_hFontAboutSmall=CreateFontIndirectW(&lf);
+    }
     return g_hFontAboutSmall;
+}
+
+static void EnableDpiAwareness(){
+    HMODULE user32=GetModuleHandleW(L"user32.dll");
+    if(!user32) return;
+
+    auto setCtx=reinterpret_cast<BOOL (WINAPI*)(DPI_AWARENESS_CONTEXT)>(
+        GetProcAddress(user32,"SetProcessDpiAwarenessContext")
+    );
+    if(setCtx){
+        if(setCtx(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)) return;
+        setCtx(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE);
+        return;
+    }
+
+    auto setAware=reinterpret_cast<BOOL (WINAPI*)(void)>(
+        GetProcAddress(user32,"SetProcessDPIAware")
+    );
+    if(setAware) setAware();
+}
+
+static int ScaleByDpi(int value,UINT dpi){
+    return MulDiv(value,dpi,USER_DEFAULT_SCREEN_DPI);
+}
+
+static HFONT CreateUiFont(UINT dpi){
+    const int basePx=15;
+    return CreateFontW(
+        ScaleByDpi(basePx,dpi),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,
+        DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,DEFAULT_QUALITY,
+        DEFAULT_PITCH|FF_MODERN,L"Consolas"
+    );
+}
+
+static void UpdateComboBoxMetrics(UINT dpi){
+    if(!g_hComboClient||!g_hFont) return;
+
+    HDC hdc=GetDC(g_hComboClient);
+    if(!hdc) return;
+
+    HFONT old=(HFONT)SelectObject(hdc,g_hFont);
+    TEXTMETRICW tm{};
+    if(GetTextMetricsW(hdc,&tm)){
+        const int itemH=tm.tmHeight+tm.tmExternalLeading+ScaleByDpi(6,dpi);
+        SendMessageW(g_hComboClient,CB_SETITEMHEIGHT,(WPARAM)-1,itemH);
+        SendMessageW(g_hComboClient,CB_SETITEMHEIGHT,0,itemH);
+    }
+    SelectObject(hdc,old);
+    ReleaseDC(g_hComboClient,hdc);
+}
+
+static void UpdateUiFont(HWND hWnd,UINT dpi){
+    HFONT hNew=CreateUiFont(dpi);
+    if(!hNew) return;
+
+    if(g_hFont) DeleteObject(g_hFont);
+    g_hFont=hNew;
+
+    if(hWnd) SendMessageW(hWnd,WM_SETFONT,(WPARAM)g_hFont,TRUE);
+    if(hWnd){
+        EnumChildWindows(hWnd,[](HWND hwnd,LPARAM lParam)->BOOL{
+            SendMessageW(hwnd,WM_SETFONT,(WPARAM)lParam,TRUE);
+            return TRUE;
+        },(LPARAM)g_hFont);
+    }
+
+    if(g_hValidationTooltip) SendMessageW(g_hValidationTooltip,WM_SETFONT,(WPARAM)g_hFont,TRUE);
+    if(g_hMenuTip) SendMessageW(g_hMenuTip,WM_SETFONT,(WPARAM)g_hFont,TRUE);
+    if(g_hBtnTmpProfTip) SendMessageW(g_hBtnTmpProfTip,WM_SETFONT,(WPARAM)g_hFont,TRUE);
+    if(g_hBtnConfigTip) SendMessageW(g_hBtnConfigTip,WM_SETFONT,(WPARAM)g_hFont,TRUE);
+
+    UpdateComboBoxMetrics(dpi);
+}
+
+static void LayoutMainGui(HWND hWnd);
+static void UpdateIconPreviewForSelection(bool preferListSelection=false);
+static void EnsureConfigMenu(HWND hWnd);
+static void SetButtonIcon(HWND hBtn,int iconResId,HICON& hStore);
+
+static void ApplyDpiScaling(HWND hWnd,UINT dpi,const RECT* suggestedRect){
+    if(dpi==0) dpi=USER_DEFAULT_SCREEN_DPI;
+    g_uiDpi=dpi;
+
+    UpdateUiFont(hWnd,dpi);
+
+    if(g_hValidationTooltip){
+        SendMessageW(g_hValidationTooltip,TTM_SETMAXTIPWIDTH,0,ScaleByDpi(400,dpi));
+    }
+    if(g_hMenuTip){
+        SendMessageW(g_hMenuTip,TTM_SETMAXTIPWIDTH,0,ScaleByDpi(450,dpi));
+    }
+
+    if(suggestedRect){
+        SetWindowPos(
+            hWnd,nullptr,
+            suggestedRect->left,
+            suggestedRect->top,
+            suggestedRect->right-suggestedRect->left,
+            suggestedRect->bottom-suggestedRect->top,
+            SWP_NOZORDER|SWP_NOACTIVATE
+        );
+    }
+
+    SetButtonIcon(g_hBtnTmpProf,IDI_TEMPB,g_hIconBtnTemp);
+    SetButtonIcon(g_hBtnConfig,IDI_CFGB,g_hIconBtnConfig);
+
+    if(g_hConfigMenu){
+        for(auto hb:g_menuBitmaps) if(hb) DeleteObject(hb);
+        g_menuBitmaps.clear();
+        DestroyMenu(g_hConfigMenu);
+        g_hConfigMenu=nullptr;
+        EnsureConfigMenu(hWnd);
+    }
+
+    LayoutMainGui(hWnd);
+    UpdateIconPreviewForSelection(true);
+}
+
+static void ResetAboutFonts(UINT dpi){
+    if(g_hAboutFont){
+        DeleteObject(g_hAboutFont);
+        g_hAboutFont=nullptr;
+    }
+    if(g_hFontAboutSmall){
+        DeleteObject(g_hFontAboutSmall);
+        g_hFontAboutSmall=nullptr;
+    }
+
+    g_hAboutFont=CreateUiFont(dpi);
+    GetAboutSmallFont();
 }
 
 struct _7zUiCtx{
@@ -354,9 +490,7 @@ void GuiProfDel();
 inline void EnsureMouseVisible();
 inline void FocusClientEdit();
 static void ShowAboutDialog();
-static void EnsureConfigMenu(HWND hWnd);
 static UINT ShowConfigMenuFromButton(HWND hWnd);
-static void SetButtonIcon(HWND hBtn,int iconResId,HICON& hStore);
 static int IcoDim(BYTE b){return (b==0)?256:(int)b;}
 static HICON  LoadIconResBestDownscale(HINSTANCE hInst,int groupIconResId,int cxDesired,int cyDesired);
 static HICON  LoadIconFromIcoBestDownscale(const fs::path& icoPath,int pxDesired);
@@ -364,8 +498,6 @@ static HBITMAP LoadMenuBitmapFromIconRes(int iconResId,UINT dpi,int cx,int cy);
 static HFONT CreateSmallerFontFrom(HFONT baseFont,int pxHeight,UINT dpi);
 static HICON ScaleIconDown_HQ(HICON hSrc,int dstCx,int dstCy);
 static bool GetIconSizePx(HICON hIcon,int& w,int& h);
-static void LayoutMainGui(HWND hWnd);
-static void UpdateIconPreviewForSelection(bool preferListSelection=false);
 static void EnsureMenuTooltips(HWND hWnd);
 static void HideMenuTooltip();
 static void HandleMenuSelect(HWND hWnd,WPARAM wParam,LPARAM lParam);
@@ -375,6 +507,7 @@ static fs::path GetProfileDirFromName(const std::wstring& name);
 
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,_In_opt_ HINSTANCE,_In_ LPWSTR lpCmdLine,_In_ int nCmdShow){
     CoInitializeEx(NULL,COINIT_APARTMENTTHREADED|COINIT_DISABLE_OLE1DDE);
+    EnableDpiAwareness();
     PWSTR path=NULL;
     if(SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData,0,NULL,&path))){
         g_sDataDir=fs::path(path)/"InfinitySys"/"ctSpaces";
@@ -519,13 +652,51 @@ ATOM MyRegisterClass(HINSTANCE hInstance){
 
 BOOL InitInstance(HINSTANCE hInstance,int nCmdShow){
     g_hInst=hInstance;
-    const int iGuiW=256+64+16+8;
-    const int iGuiH=128+16+8+4;
-    const int iGuiM=4;
-    const int iGuiCtrlW=(iGuiW-iGuiM*2);
-    g_hFont=CreateFontW(15,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,DEFAULT_QUALITY,DEFAULT_PITCH|FF_MODERN,L"Consolas");
-    g_hGui=CreateWindowW(GUI_CLASS_NAME.c_str(),APP_TITLE.c_str(),WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,CW_USEDEFAULT,0,iGuiW,iGuiH,nullptr,nullptr,hInstance,nullptr);
+    const int baseGuiW=256+64+16+8;
+    const int baseGuiH=64+32+16+8+4;
+    const int baseGuiM=4;
+    const int baseCtrlW=(baseGuiW-baseGuiM*2);
+
+    UINT dpi=GetDpiForSystem();
+    g_uiDpi=dpi;
+
+    const int guiClientW=ScaleByDpi(baseGuiW,dpi);
+    const int guiClientH=ScaleByDpi(baseGuiH,dpi);
+    RECT wr{0,0,guiClientW,guiClientH};
+
+    const DWORD style=WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX;
+    const DWORD exStyle=0;
+    auto adjustForDpi=reinterpret_cast<BOOL (WINAPI*)(LPRECT,DWORD,BOOL,DWORD,UINT)>(
+        GetProcAddress(GetModuleHandleW(L"user32.dll"),"AdjustWindowRectExForDpi")
+    );
+    if(adjustForDpi){
+        adjustForDpi(&wr,style,FALSE,exStyle,dpi);
+    } else{
+        AdjustWindowRectEx(&wr,style,FALSE,exStyle);
+    }
+
+    g_hGui=CreateWindowW(
+        GUI_CLASS_NAME.c_str(),
+        APP_TITLE.c_str(),
+        style,
+        CW_USEDEFAULT,
+        0,
+        wr.right-wr.left,
+        wr.bottom-wr.top,
+        nullptr,
+        nullptr,
+        hInstance,
+        nullptr
+    );
     if(!g_hGui) return FALSE;
+
+    dpi=GetDpiForWindow(g_hGui);
+    g_uiDpi=dpi;
+    g_hFont=CreateUiFont(dpi);
+
+    const int iGuiM=ScaleByDpi(baseGuiM,dpi);
+    const int iGuiCtrlW=ScaleByDpi(baseCtrlW,dpi);
+    const int labelH=ScaleByDpi(17,dpi);
     HICON hAppIcon=LoadIcon(hInstance,MAKEINTRESOURCE(IDI_CTSPACES));
     if(hAppIcon){
         SendMessage(g_hGui,WM_SETICON,ICON_BIG,(LPARAM)hAppIcon);
@@ -533,12 +704,13 @@ BOOL InitInstance(HINSTANCE hInstance,int nCmdShow){
     }
     BOOL isDarkMode=TRUE;
     DwmSetWindowAttribute(g_hGui,DWMWA_USE_IMMERSIVE_DARK_MODE,&isDarkMode,sizeof(isDarkMode));
-    CreateWindowW(L"STATIC",L"Select or type the client name:",WS_CHILD|WS_VISIBLE,iGuiM,iGuiM,iGuiCtrlW,17,g_hGui,(HMENU)101,hInstance,nullptr);
+    CreateWindowW(L"STATIC",L"Select or type the client name:",WS_CHILD|WS_VISIBLE,iGuiM,iGuiM,iGuiCtrlW,labelH,g_hGui,(HMENU)101,hInstance,nullptr);
     g_hValidationTooltip=CreateWindowEx(WS_EX_TOPMOST,TOOLTIPS_CLASS,NULL,TTS_BALLOON|TTS_NOPREFIX|TTS_ALWAYSTIP,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,g_hGui,NULL,g_hInst,NULL);
     SendMessageW(g_hGui,WM_SETFONT,(WPARAM)g_hFont,TRUE);
     SendMessageW(g_hValidationTooltip,WM_SETFONT,(WPARAM)g_hFont,TRUE);
-    SendMessage(g_hValidationTooltip,TTM_SETMAXTIPWIDTH,0,400);
-    g_hComboClient=CreateWindowW(L"COMBOBOX",L"",WS_CHILD|WS_VISIBLE|CBS_DROPDOWN|CBS_AUTOHSCROLL|WS_VSCROLL,iGuiM,17+iGuiM*2,iGuiCtrlW-iGuiM*4,150,g_hGui,(HMENU)102,hInstance,nullptr);
+    SendMessage(g_hValidationTooltip,TTM_SETMAXTIPWIDTH,0,ScaleByDpi(400,dpi));
+    g_hComboClient=CreateWindowW(L"COMBOBOX",L"",WS_CHILD|WS_VISIBLE|CBS_DROPDOWN|CBS_AUTOHSCROLL|WS_VSCROLL,iGuiM,labelH+iGuiM*2,iGuiCtrlW-iGuiM*4,ScaleByDpi(150,dpi),g_hGui,(HMENU)102,hInstance,nullptr);
+    UpdateComboBoxMetrics(dpi);
     TOOLINFOW tic={sizeof(TOOLINFOW)};
     tic.uFlags=TTF_SUBCLASS|TTF_TRANSPARENT|TTF_TRACK;
     tic.hwnd=g_hGui;
@@ -546,18 +718,21 @@ BOOL InitInstance(HINSTANCE hInstance,int nCmdShow){
     tic.uId=(UINT_PTR)g_hComboClient;
     tic.lpszText=LPSTR_TEXTCALLBACK;
     SendMessage(g_hValidationTooltip,TTM_ADDTOOL,0,(LPARAM)&tic);
-    g_hBtnGo=CreateWindowW(L"BUTTON",L"Go",WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON,(iGuiCtrlW/2)-32-4,(25*2)+iGuiM,64,33,g_hGui,(HMENU)IDOK,hInstance,nullptr);
+    const int goW=ScaleByDpi(64,dpi);
+    const int goH=ScaleByDpi(33,dpi);
+    g_hBtnGo=CreateWindowW(L"BUTTON",L"Go",WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON,(iGuiCtrlW/2)-ScaleByDpi(32,dpi)-ScaleByDpi(4,dpi),ScaleByDpi(50,dpi)+iGuiM,goW,goH,g_hGui,(HMENU)IDOK,hInstance,nullptr);
     //HWND hToolTip=CreateWindowEx(0,TOOLTIPS_CLASS,NULL,TTS_ALWAYSTIP|TTS_NOPREFIX,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,g_hGui,NULL,g_hInst,NULL);
     RECT rc{};
     GetClientRect(g_hGui,&rc);
-    const int iBtnS=24,iBtnM=2,iBtnT=rc.bottom-iGuiM-iBtnS;
+    const int iBtnS=ScaleByDpi(24,dpi);
+    const int iBtnT=rc.bottom-iGuiM-iBtnS;
     int iBtnL=rc.right-iGuiM-iBtnS;
     g_hBtnConfig=CreateWindowW(L"BUTTON",L"",WS_CHILD|WS_VISIBLE|BS_ICON,iBtnL,iBtnT,iBtnS,iBtnS,g_hGui,(HMENU)(INT_PTR)201,g_hInst,nullptr);
     g_hBtnTmpProf=CreateWindowW(L"BUTTON",L"",WS_CHILD|WS_VISIBLE|BS_ICON,iBtnL-iBtnS-iGuiM,iBtnT,iBtnS,iBtnS,g_hGui,(HMENU)(INT_PTR)200,g_hInst,nullptr);
     SetButtonIcon(g_hBtnTmpProf,IDI_TEMPB,g_hIconBtnTemp);
     SetButtonIcon(g_hBtnConfig,IDI_CFGB,g_hIconBtnConfig);
-    CreateToolTip(g_hBtnTmpProf,g_hGui,(LPWSTR)L"Launch temporary profile");
-    CreateToolTip(g_hBtnConfig,g_hGui,(LPWSTR)L"Options / Profile actions");
+    g_hBtnTmpProfTip=CreateToolTip(g_hBtnTmpProf,g_hGui,(LPWSTR)L"Launch temporary profile");
+    g_hBtnConfigTip=CreateToolTip(g_hBtnConfig,g_hGui,(LPWSTR)L"Options / Profile actions");
     EnsureConfigMenu(g_hGui);
 
     // Create the Icon group + preview (positions set by LayoutMainGui)
@@ -644,7 +819,8 @@ LRESULT CALLBACK WndProc(HWND hWnd,UINT message,WPARAM wParam,LPARAM lParam){
                     SendMessage(g_hValidationTooltip,TTM_UPDATETIPTEXT,0,(LPARAM)&ti);
                     RECT rect;
                     GetWindowRect(g_hComboClient,&rect);
-                    SendMessage(g_hValidationTooltip,TTM_TRACKPOSITION,0,MAKELPARAM(rect.left+4,rect.bottom-4));
+                    const int tipPad=ScaleByDpi(4,g_uiDpi);
+                    SendMessage(g_hValidationTooltip,TTM_TRACKPOSITION,0,MAKELPARAM(rect.left+tipPad,rect.bottom-tipPad));
                     SendMessage(g_hValidationTooltip,TTM_TRACKACTIVATE,TRUE,(LPARAM)&ti);
                     SendMessage(g_hComboClient,CB_SHOWDROPDOWN,FALSE,0);
                 } else{
@@ -846,6 +1022,14 @@ LRESULT CALLBACK WndProc(HWND hWnd,UINT message,WPARAM wParam,LPARAM lParam){
             DestroyWindow(g_hMenuTip);
             g_hMenuTip=nullptr;
         }
+        if(g_hBtnTmpProfTip){
+            DestroyWindow(g_hBtnTmpProfTip);
+            g_hBtnTmpProfTip=nullptr;
+        }
+        if(g_hBtnConfigTip){
+            DestroyWindow(g_hBtnConfigTip);
+            g_hBtnConfigTip=nullptr;
+        }
         if(g_hFontAboutSmall){ DeleteObject(g_hFontAboutSmall); g_hFontAboutSmall=nullptr; }
         if(g_hFont) DeleteObject(g_hFont);
         PostQuitMessage(0);
@@ -862,19 +1046,9 @@ LRESULT CALLBACK WndProc(HWND hWnd,UINT message,WPARAM wParam,LPARAM lParam){
         return 0;
     }
     case WM_DPICHANGED: {
-        SetButtonIcon(g_hBtnTmpProf,IDI_TEMPB,g_hIconBtnTemp);
-        SetButtonIcon(g_hBtnConfig,IDI_CFGB,g_hIconBtnConfig);
-
-        if(g_hConfigMenu){
-            for(auto hb:g_menuBitmaps) if(hb) DeleteObject(hb);
-            g_menuBitmaps.clear();
-            DestroyMenu(g_hConfigMenu);
-            g_hConfigMenu=nullptr;
-            EnsureConfigMenu(hWnd);
-        }
-
-        LayoutMainGui(hWnd);
-        UpdateIconPreviewForSelection(true);
+        const UINT dpi=HIWORD(wParam);
+        const RECT* rc=reinterpret_cast<RECT*>(lParam);
+        ApplyDpiScaling(hWnd,dpi,rc);
         return 0;
     }
     case WM_SIZE:
@@ -2175,6 +2349,128 @@ inline void FocusClientEdit(){
 }
 
 static INT_PTR CALLBACK AboutDlgProc(HWND hDlg,UINT msg,WPARAM wParam,LPARAM lParam){
+    constexpr int kIdIcon=1001;
+    constexpr int kIdTitle=1002;
+    constexpr int kIdBy=1003;
+    constexpr int kIdLink=1004;
+    constexpr int kIdThanks=1005;
+
+    auto ensureStatic=[&](int id,const wchar_t* text,DWORD style,int x,int y,int width,int height)->HWND{
+        HWND hwnd=GetDlgItem(hDlg,id);
+        if(!hwnd){
+            hwnd=CreateWindowW(L"STATIC",text,WS_CHILD|WS_VISIBLE|style,
+                               x,y,width,height,
+                               hDlg,(HMENU)id,g_hInst,nullptr);
+        } else{
+            SetWindowTextW(hwnd,text);
+            MoveWindow(hwnd,x,y,width,height,TRUE);
+        }
+        return hwnd;
+    };
+
+    auto ensureLink=[&](int id,const wchar_t* text,int x,int y,int width,int height)->HWND{
+        HWND hwnd=GetDlgItem(hDlg,id);
+        if(!hwnd){
+            hwnd=CreateWindowW(WC_LINK,text,WS_CHILD|WS_VISIBLE|WS_TABSTOP,
+                               x,y,width,height,
+                               hDlg,(HMENU)id,g_hInst,nullptr);
+        } else{
+            SetWindowTextW(hwnd,text);
+            MoveWindow(hwnd,x,y,width,height,TRUE);
+        }
+        return hwnd;
+    };
+
+    auto relayout=[&](UINT dpi,const RECT* suggested){
+        ResetAboutFonts(dpi);
+
+        const int margin=MulDiv(12,dpi,96);
+        const int iconPx=MulDiv(64,dpi,96);
+
+        const int dlgW=MulDiv(480,dpi,96);
+        const int dlgH=MulDiv(192,dpi,96);
+
+        RECT wnd{};
+        if(suggested){
+            wnd=*suggested;
+        } else{
+            GetWindowRect(hDlg,&wnd);
+        }
+        SetWindowPos(hDlg,nullptr,wnd.left,wnd.top,dlgW,dlgH,SWP_NOZORDER|SWP_NOACTIVATE);
+
+        RECT rc{};
+        GetClientRect(hDlg,&rc);
+
+        const int xIco=margin;
+        const int yTop=margin;
+
+        HWND hIco=GetDlgItem(hDlg,kIdIcon);
+        if(!hIco){
+            hIco=CreateWindowW(L"STATIC",L"",WS_CHILD|WS_VISIBLE|SS_ICON,
+                               xIco,yTop,iconPx,iconPx,
+                               hDlg,(HMENU)kIdIcon,g_hInst,nullptr);
+        } else{
+            MoveWindow(hIco,xIco,yTop,iconPx,iconPx,TRUE);
+        }
+
+        const int xText=xIco+iconPx+margin;
+        const int wText=rc.right-xText-margin;
+
+        HWND hTitle=ensureStatic(kIdTitle,APP_TITLE.c_str(),SS_LEFT|SS_NOPREFIX,
+                                 xText,yTop,wText,MulDiv(24,dpi,96));
+
+        HWND hBy=ensureStatic(kIdBy,L"by BiatuAutMiahn",SS_LEFT|SS_NOPREFIX,
+                              xText+MulDiv(16,dpi,96),yTop+MulDiv(20,dpi,96),wText,MulDiv(20,dpi,96));
+
+        const wchar_t* linkText=
+            L"<a href=\"https://github.com/BiatuAutMiahn/ctSpaces\">https://github.com/BiatuAutMiahn/ctSpaces</a>";
+
+        HWND hLink=ensureLink(kIdLink,linkText,
+                              xText,yTop+MulDiv(36,dpi,96),rc.right-margin*2,MulDiv(24,dpi,96));
+
+        const wchar_t* thanksText=
+            L"Thanks:\r\n"
+            L"  Igor Pavlov (7-Zip)\r\n"
+            L"  OpenAI (R&D and rapid prototyping)\r\n"
+            L"  Google (Material Icons)";
+
+        HWND hThanks=ensureStatic(kIdThanks,thanksText,SS_LEFT|SS_NOPREFIX,
+                                  xText,yTop+MulDiv(68,dpi,96),MulDiv(256,dpi,96),MulDiv(80,dpi,96));
+
+        HWND hOk=GetDlgItem(hDlg,IDOK);
+        if(hOk){
+            RECT br{};
+            GetWindowRect(hOk,&br);
+            const int bw=br.right-br.left;
+            const int bh=br.bottom-br.top;
+            MoveWindow(hOk,rc.right-margin-bw,rc.bottom-margin-bh,bw,bh,TRUE);
+        }
+
+        HFONT hFont=g_hAboutFont?g_hAboutFont:g_hFont;
+        if(hOk)     SendMessageW(hOk,WM_SETFONT,(WPARAM)hFont,TRUE);
+        if(hThanks) SendMessageW(hThanks,WM_SETFONT,(WPARAM)hFont,TRUE);
+        if(hTitle)  SendMessageW(hTitle,WM_SETFONT,(WPARAM)hFont,TRUE);
+        if(hBy)     SendMessageW(hBy,WM_SETFONT,(WPARAM)GetAboutSmallFont(),TRUE);
+        if(hLink)   SendMessageW(hLink,WM_SETFONT,(WPARAM)hFont,TRUE);
+
+        const int sm=GetSystemMetricsForDpi(SM_CXSMICON,dpi);
+        const int bg=GetSystemMetricsForDpi(SM_CXICON,dpi);
+
+        if(g_hAboutDlgSmall){ DestroyIcon(g_hAboutDlgSmall); g_hAboutDlgSmall=nullptr; }
+        if(g_hAboutDlgBig){ DestroyIcon(g_hAboutDlgBig); g_hAboutDlgBig=nullptr; }
+        if(g_hAboutIcon64){ DestroyIcon(g_hAboutIcon64); g_hAboutIcon64=nullptr; }
+
+        g_hAboutDlgSmall=LoadIconResBestDownscale(g_hInst,IDI_CTSPACES,sm,sm);
+        g_hAboutDlgBig=LoadIconResBestDownscale(g_hInst,IDI_CTSPACES,bg,bg);
+        if(g_hAboutDlgSmall) SendMessageW(hDlg,WM_SETICON,ICON_SMALL,(LPARAM)g_hAboutDlgSmall);
+        if(g_hAboutDlgBig)   SendMessageW(hDlg,WM_SETICON,ICON_BIG,(LPARAM)g_hAboutDlgBig);
+
+        g_hAboutIcon64=LoadIconResBestDownscale(g_hInst,IDI_IRND,iconPx,iconPx);
+        if(hIco&&g_hAboutIcon64){
+            SendMessageW(hIco,STM_SETIMAGE,IMAGE_ICON,(LPARAM)g_hAboutIcon64);
+        }
+    };
+
     switch(msg){
     case WM_INITDIALOG: {
         const UINT dpi=GetDpiForWindow(hDlg);
@@ -2190,101 +2486,15 @@ static INT_PTR CALLBACK AboutDlgProc(HWND hDlg,UINT msg,WPARAM wParam,LPARAM lPa
             return TRUE;
         },0);
 
-        // Dialog icons (caption)
-        const int sm=GetSystemMetricsForDpi(SM_CXSMICON,dpi);
-        const int bg=GetSystemMetricsForDpi(SM_CXICON,dpi);
-        g_hAboutDlgSmall=LoadIconResBestDownscale(g_hInst,IDI_CTSPACES,sm,sm);
-        g_hAboutDlgBig=LoadIconResBestDownscale(g_hInst,IDI_CTSPACES,bg,bg);
-        int iw,ih;
-        if(GetIconSizePx(g_hAboutDlgSmall,iw,ih)){
-            wchar_t b[128];
-            wsprintfW(b,L"AboutDlgSmall size = %dx%d\n",iw,ih);
-            OutputDebugStringW(b);
-        }
+        relayout(dpi,nullptr);
 
-        g_hAboutDlgSmall=LoadIcon(g_hInst,MAKEINTRESOURCE(IDI_CTSPACES));
-        g_hAboutDlgSmall=LoadIcon(g_hInst,MAKEINTRESOURCE(IDI_CTSPACES));
-        if(g_hAboutDlgSmall) SendMessageW(hDlg,WM_SETICON,ICON_SMALL,(LPARAM)g_hAboutDlgSmall);
-        if(g_hAboutDlgBig)   SendMessageW(hDlg,WM_SETICON,ICON_BIG,(LPARAM)g_hAboutDlgBig);
+        return (INT_PTR)TRUE;
+    }
 
-        // Layout
-        const int margin=MulDiv(12,dpi,96);
-        const int gap=MulDiv(8,dpi,96);
-        const int iconPx=MulDiv(64,dpi,96);
-
-        // Load 64px icon for content area
-        g_hAboutIcon64=LoadIconResBestDownscale(g_hInst,IDI_IRND,iconPx,iconPx);
-        
-        // Resize dialog to fit (bigger than the stock one)
-        const int dlgW=MulDiv(480,dpi,96);
-        const int dlgH=MulDiv(192,dpi,96);
-        SetWindowPos(hDlg,nullptr,0,0,dlgW,dlgH,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
-
-        RECT rc{};
-        GetClientRect(hDlg,&rc);
-
-        // Create our content controls
-        const int xIco=margin;
-        const int yTop=margin;
-
-        HWND hIco=CreateWindowW(L"STATIC",L"",WS_CHILD|WS_VISIBLE|SS_ICON,
-                                xIco,yTop,iconPx,iconPx,
-                                hDlg,(HMENU)1001,g_hInst,nullptr);
-        if(hIco&&g_hAboutIcon64){
-            SendMessageW(hIco,STM_SETIMAGE,IMAGE_ICON,(LPARAM)g_hAboutIcon64);
-        }
-
-        const int xText=xIco+iconPx+margin;
-        const int wText=rc.right-xText-margin;
-
-        HWND hTitle=CreateWindowW(L"STATIC",APP_TITLE.c_str(),
-                                  WS_CHILD|WS_VISIBLE|SS_LEFT|SS_NOPREFIX,
-                                  xText,yTop,wText,MulDiv(24,dpi,96),
-                                  hDlg,(HMENU)1002,g_hInst,nullptr);
-
-        HWND hBy=CreateWindowW(L"STATIC",L"by BiatuAutMiahn",
-                               WS_CHILD|WS_VISIBLE|SS_LEFT|SS_NOPREFIX,
-                               xText+MulDiv(16,dpi,96),yTop+MulDiv(20,dpi,96),wText,MulDiv(20,dpi,96),
-                               hDlg,(HMENU)1003,g_hInst,nullptr);
-
-        // Use SysLink so the URL is clickable (needs comctl32 v6, which you have)
-        const wchar_t* linkText=
-            L"<a href=\"https://github.com/BiatuAutMiahn/ctSpaces\">https://github.com/BiatuAutMiahn/ctSpaces</a>";
-
-        HWND hLink=CreateWindowW(WC_LINK,linkText,
-                                 WS_CHILD|WS_VISIBLE|WS_TABSTOP,
-                                 xText,yTop+MulDiv(36,dpi,96),rc.right-margin*2,MulDiv(24,dpi,96),
-                                 hDlg,(HMENU)1004,g_hInst,nullptr);
-
-        const wchar_t* thanksText=
-            L"Thanks:\r\n"
-            L"  Igor Pavlov (7-Zip)\r\n"
-            L"  OpenAI (R&D and rapid prototyping)\r\n"
-            L"  Google (Material Icons)";
-
-        HWND hThanks=CreateWindowW(L"STATIC",thanksText,
-                                   WS_CHILD|WS_VISIBLE|SS_LEFT|SS_NOPREFIX,
-                                   xText,yTop+MulDiv(68,dpi,96),MulDiv(256,dpi,96),MulDiv(80,dpi,96),
-                                   hDlg,(HMENU)1005,g_hInst,nullptr);
-
-        // OK button: keep its size, move to bottom-right
-        HWND hOk=GetDlgItem(hDlg,IDOK);
-        if(hOk){
-            RECT br{};
-            GetWindowRect(hOk,&br);
-            const int bw=br.right-br.left;
-            const int bh=br.bottom-br.top;
-            MoveWindow(hOk,rc.right-margin-bw,rc.bottom-margin-bh,bw,bh,TRUE);
-            SendMessageW(hOk,WM_SETFONT,(WPARAM)g_hFont,TRUE);
-        }
-
-
-        // Fonts
-        if(hThanks) SendMessageW(hThanks,WM_SETFONT,(WPARAM)g_hFont,TRUE);
-        if(hTitle) SendMessageW(hTitle,WM_SETFONT,(WPARAM)g_hFont,TRUE);
-        if(hBy)    SendMessageW(hBy,WM_SETFONT,(WPARAM)GetAboutSmallFont(),TRUE);
-        if(hLink)  SendMessageW(hLink,WM_SETFONT,(WPARAM)g_hFont,TRUE);
-
+    case WM_DPICHANGED: {
+        const UINT dpi=HIWORD(wParam);
+        const RECT* rc=reinterpret_cast<RECT*>(lParam);
+        relayout(dpi,rc);
         return (INT_PTR)TRUE;
     }
 
@@ -2292,7 +2502,7 @@ static INT_PTR CALLBACK AboutDlgProc(HWND hDlg,UINT msg,WPARAM wParam,LPARAM lPa
         NMHDR* nm=(NMHDR*)lParam;
         if(!nm) break;
 
-        if((nm->code==NM_CLICK||nm->code==NM_RETURN)&&nm->idFrom==1004){
+        if((nm->code==NM_CLICK||nm->code==NM_RETURN)&&nm->idFrom==kIdLink){
             auto* link=(NMLINK*)lParam;
             if(link) ShellExecuteW(hDlg,L"open",link->item.szUrl,nullptr,nullptr,SW_SHOWNORMAL);
             return (INT_PTR)TRUE;
@@ -2308,9 +2518,11 @@ static INT_PTR CALLBACK AboutDlgProc(HWND hDlg,UINT msg,WPARAM wParam,LPARAM lPa
         break;
 
     case WM_DESTROY:
+        if(g_hAboutFont){ DeleteObject(g_hAboutFont); g_hAboutFont=nullptr; }
         if(g_hAboutIcon64){ DestroyIcon(g_hAboutIcon64);    g_hAboutIcon64=nullptr; }
         if(g_hAboutDlgSmall){ DestroyIcon(g_hAboutDlgSmall);  g_hAboutDlgSmall=nullptr; }
         if(g_hAboutDlgBig){ DestroyIcon(g_hAboutDlgBig);    g_hAboutDlgBig=nullptr; }
+        if(g_hFontAboutSmall){ DeleteObject(g_hFontAboutSmall); g_hFontAboutSmall=nullptr; }
         break;
     }
     return (INT_PTR)FALSE;
@@ -2724,7 +2936,7 @@ static void EnsureMenuTooltips(HWND hWnd){
     if(!g_hMenuTip) return;
 
     SetWindowPos(g_hMenuTip,HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
-    SendMessageW(g_hMenuTip,TTM_SETMAXTIPWIDTH,0,450);
+    SendMessageW(g_hMenuTip,TTM_SETMAXTIPWIDTH,0,ScaleByDpi(450,g_uiDpi));
     SendMessageW(g_hMenuTip,WM_SETFONT,(WPARAM)g_hFont,TRUE);
 
     ZeroMemory(&g_menuTi,sizeof(g_menuTi));

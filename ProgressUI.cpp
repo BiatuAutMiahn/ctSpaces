@@ -18,12 +18,17 @@ static HWND g_hOwner=nullptr;   // main GUI window
 static std::wstring g_baseText;
 static int  g_lastPercent=0;
 static bool g_marquee=false;
+static UINT g_dpi=USER_DEFAULT_SCREEN_DPI;
 
 static const wchar_t* kProgClass=L"ctSpaces.ProgressUI";
 
 // Forward decl
 static void LayoutControls();
 static void RepositionInOwner(HWND owner,int desiredW,int desiredH);
+
+static int ScaleByDpi(int value,UINT dpi){
+    return MulDiv(value,dpi,USER_DEFAULT_SCREEN_DPI);
+}
 
 static std::wstring ComposeCaption(const std::wstring& baseText,int percent){
     if(baseText.empty())
@@ -63,6 +68,22 @@ static LRESULT CALLBACK ProgressWndProc(HWND hWnd,UINT msg,WPARAM wParam,LPARAM 
     case WM_SIZE:
         LayoutControls();
         return 0;
+
+    case WM_DPICHANGED:
+    {
+        const UINT dpi=HIWORD(wParam);
+        g_dpi=(dpi?dpi:USER_DEFAULT_SCREEN_DPI);
+        const RECT* rc=reinterpret_cast<RECT*>(lParam);
+        if(rc){
+            SetWindowPos(hWnd,nullptr,
+                         rc->left,rc->top,
+                         rc->right-rc->left,
+                         rc->bottom-rc->top,
+                         SWP_NOZORDER|SWP_NOACTIVATE);
+        }
+        LayoutControls();
+        return 0;
+    }
 
     case WM_CLOSE:
         return 0; // ignore close; controlled by ProgressUI_Hide()
@@ -115,6 +136,7 @@ static void EnsureWindow(HWND owner){
         g_hInst,
         nullptr
     );
+    g_dpi=GetDpiForWindow(g_hWnd);
 
     // If you want to be extra sure there's no Close:
     // - Ensure no system menu
@@ -139,6 +161,8 @@ static void EnsureWindow(HWND owner){
     );
 
     SetWindowTheme(g_hBar,L"Explorer",nullptr);
+    SendMessageW(g_hBar,PBM_SETBKCOLOR,0,GetSysColor(COLOR_WINDOW));
+    SendMessageW(g_hBar,PBM_SETBARCOLOR,0,GetSysColor(COLOR_HIGHLIGHT));
     SendMessageW(g_hBar,PBM_SETRANGE,0,MAKELPARAM(0,100));
     SendMessageW(g_hBar,PBM_SETPOS,0,0);
 
@@ -154,6 +178,8 @@ static void RepositionInOwner(HWND owner,int desiredW,int desiredH){
     if(!g_hWnd||!IsWindow(g_hWnd)||!owner||!IsWindow(owner))
         return;
 
+    g_dpi=GetDpiForWindow(owner);
+
     RECT rcClient{};
     GetClientRect(owner,&rcClient);
 
@@ -161,18 +187,21 @@ static void RepositionInOwner(HWND owner,int desiredW,int desiredH){
     POINT origin{0, 0};
     ClientToScreen(owner,&origin);
 
-    const int pad=10;
+    const int pad=ScaleByDpi(10,g_dpi);
     int ownerW=rcClient.right-rcClient.left;
     int ownerH=rcClient.bottom-rcClient.top;
 
     int availW=(std::max)(0,ownerW-pad*2);
     int availH=(std::max)(0,ownerH-pad*2);
 
-    int w=(std::min)(desiredW,availW);
-    int h=(std::min)(desiredH,availH);
+    const int desiredWpx=ScaleByDpi(desiredW,g_dpi);
+    const int desiredHpx=ScaleByDpi(desiredH,g_dpi);
 
-    w=(std::max)(w,260);
-    h=(std::max)(h,70);
+    int w=(std::min)(desiredWpx,availW);
+    int h=(std::min)(desiredHpx,availH);
+
+    w=(std::max)(w,ScaleByDpi(260,g_dpi));
+    h=(std::max)(h,ScaleByDpi(70,g_dpi));
 
     int x=origin.x+pad+(availW-w)/2;
     int y=origin.y+pad+(availH-h)/2;
@@ -190,8 +219,8 @@ static void LayoutControls(){
     int h=rc.bottom-rc.top;
 
     // Only a centered progress bar in the CLIENT area (below caption automatically)
-    const int barH=22;
-    const int padX=16;
+    const int barH=ScaleByDpi(22,g_dpi);
+    const int padX=ScaleByDpi(16,g_dpi);
 
     int barW=(std::max)(0,w-padX*2);
     int x=padX;
