@@ -22,6 +22,7 @@
 #include <propvarutil.h>
 #include <gdiplus.h>
 #include <shobjidl.h>
+#include "theme.h"
 #include "ProgressUI.h"
 #include "InProc7z.h"
 
@@ -41,6 +42,7 @@
 #include <mutex> 
 #include <map> 
 #include <limits> // for std::numeric_limits
+#include <cwchar>
 
 #include "resource.h" // For IDR_7ZA and IDR_DEFAULT_7Z
 
@@ -101,7 +103,7 @@ enum class ProfileType{
 
 const std::wstring APP_ALIAS=L"ctSpaces";
 const std::wstring APP_VERSION=L"2.3";
-const std::wstring APP_VARIANT=L"pre3";
+const std::wstring APP_VARIANT=L"pre6";
 const std::wstring APP_TITLE=std::format(L"{} v{}{}",APP_ALIAS,APP_VERSION,APP_VARIANT);
 const std::wstring GUI_CLASS_NAME=L"ctSpacesLauncherClass";
 HICON g_hIconBtnTemp=nullptr;
@@ -118,6 +120,16 @@ HWND g_hBtnTmpProf=NULL;
 HWND g_hBtnConfig=NULL;
 HMENU g_hConfigMenu=nullptr;
 std::vector<HBITMAP> g_menuBitmaps; // owned; freed on WM_DESTROY
+struct MenuItemData{
+    std::wstring text;
+    HICON hIcon=nullptr;
+    bool separator=false;
+};
+std::vector<std::unique_ptr<MenuItemData>> g_aMenuItemData; // owned; cleared when menu rebuilt/destroyed
+int g_iMenuIconPx=0;
+int g_iMenuMinWidth=0;
+HWND g_hThemeCombo=nullptr;
+const int g_iThemeSeparatorIndex=3;
 HFONT g_hFont=NULL;
 static UINT g_uiDpi=USER_DEFAULT_SCREEN_DPI;
 fs::path g_sDataDir;
@@ -144,6 +156,7 @@ IShellLink* shellLink=NULL;
 #define IDM_CTX_RESET_PROFILE        41003
 #define IDM_CTX_DELETE_PROFILE       41004
 #define IDM_CTX_EDIT_DEFAULT_PROFILE 41005
+#define IDM_CTX_THEME_COLOR          41006
 #define IDC_ABOUT_ICON   5101
 #define IDC_ABOUT_TITLE  5102
 #define IDC_ABOUT_BY     5103
@@ -153,6 +166,9 @@ IShellLink* shellLink=NULL;
 #define IDC_GRP_ICON      301
 #define IDC_ICON_PREVIEW  302
 #define IDC_LBL_ICON      303
+#define IDC_THEME_COMBO   5201
+#define IDC_THEME_APPLY   5202
+#define IDC_THEME_CANCEL  5203
 
 static HWND g_hLblIcon=nullptr;
 
@@ -161,6 +177,8 @@ static HWND g_hLblIcon=nullptr;
 static HWND  g_hGrpIcon=nullptr;
 static HWND  g_hIconPreview=nullptr;
 static HICON g_hIconPreviewHandle=nullptr;
+static RECT  g_rcIconBox{};
+static HWND  g_hHotButton=nullptr;
 
 // Menu tooltip state
 static HWND     g_hMenuTip=nullptr;
@@ -174,6 +192,50 @@ static HFONT g_hAboutFont=nullptr;
 static HICON g_hAboutIcon64=nullptr;
 static HICON g_hAboutDlgSmall=nullptr;
 static HICON g_hAboutDlgBig=nullptr;
+static int g_iComboItemHeight=0;
+static int g_iThemeMode=1; // 0=System Auto, 1=System Light, 2=System Dark, >=3 custom themes
+static bool g_bThemeIsDark=false;
+static HBRUSH g_hbrThemeWindow=nullptr;
+static HBRUSH g_hbrThemeControl=nullptr;
+static HBRUSH g_hbrThemeButton=nullptr;
+static HBRUSH g_hbrThemeControlHot=nullptr;
+static HBRUSH g_hbrThemeMenu=nullptr;
+static HBRUSH g_hbrThemeMenuSel=nullptr;
+static HBRUSH g_hbrThemeBorder=nullptr;
+static HBRUSH g_hbrThemeIconPreview=nullptr;
+static HICON g_hIconColorLight=nullptr;
+static HICON g_hIconColorDark=nullptr;
+static HBITMAP g_hBmpColorLight=nullptr;
+static HBITMAP g_hBmpColorDark=nullptr;
+
+struct ThemeColors{
+    COLORREF crWindow;
+    COLORREF crWindowText;
+    COLORREF crCaption;
+    COLORREF crCaptionText;
+    COLORREF crControl;
+    COLORREF crControlText;
+    COLORREF crButtonFace;
+    COLORREF crButtonText;
+    COLORREF crControlHot;
+    COLORREF crControlBorder;
+    COLORREF crAccent;
+    COLORREF crAccentText;
+    COLORREF crMenu;
+    COLORREF crMenuText;
+    COLORREF crMenuSel;
+    COLORREF crMenuSelText;
+    COLORREF crTip;
+    COLORREF crTipText;
+};
+
+static ThemeColors g_themeColors{};
+struct ThemeEntry{
+    std::wstring name;
+    ThemeColors colors{};
+    bool dark=false;
+};
+static std::vector<ThemeEntry> g_aCustomThemes;
 
 static HFONT GetAboutSmallFont(){
     if(g_hFontAboutSmall) return g_hFontAboutSmall;
@@ -228,6 +290,7 @@ static void UpdateComboBoxMetrics(UINT dpi){
     TEXTMETRICW tm{};
     if(GetTextMetricsW(hdc,&tm)){
         const int itemH=tm.tmHeight+tm.tmExternalLeading+ScaleByDpi(6,dpi);
+        g_iComboItemHeight=itemH;
         SendMessageW(g_hComboClient,CB_SETITEMHEIGHT,(WPARAM)-1,itemH);
         SendMessageW(g_hComboClient,CB_SETITEMHEIGHT,0,itemH);
     }
@@ -262,6 +325,13 @@ static void LayoutMainGui(HWND hWnd);
 static void UpdateIconPreviewForSelection(bool preferListSelection=false);
 static void EnsureConfigMenu(HWND hWnd);
 static void SetButtonIcon(HWND hBtn,int iconResId,HICON& hStore);
+static LRESULT CALLBACK ButtonHotSubclassProc(HWND hWnd,UINT msg,WPARAM wParam,LPARAM lParam,
+                                              UINT_PTR uIdSubclass,DWORD_PTR /*dwRefData*/);
+static void PreloadThemeIcons(UINT dpi);
+static HICON LoadIconResBestDownscale(HINSTANCE hInst,int groupIconResId,int cxDesired,int cyDesired);
+static HBITMAP IconToMenuBitmap(HICON hIcon,int cx,int cy);
+static void ClearMenuItemData();
+static bool GetIconSizePx(HICON hIcon,int& w,int& h);
 
 static void ApplyDpiScaling(HWND hWnd,UINT dpi,const RECT* suggestedRect){
     if(dpi==0) dpi=USER_DEFAULT_SCREEN_DPI;
@@ -287,9 +357,10 @@ static void ApplyDpiScaling(HWND hWnd,UINT dpi,const RECT* suggestedRect){
         );
     }
 
-    SetButtonIcon(g_hBtnTmpProf,IDI_TEMPB,g_hIconBtnTemp);
-    SetButtonIcon(g_hBtnConfig,IDI_CFGB,g_hIconBtnConfig);
+    SetButtonIcon(g_hBtnTmpProf,g_bThemeIsDark?IDI_TEMPW:IDI_TEMPB,g_hIconBtnTemp);
+    SetButtonIcon(g_hBtnConfig,g_bThemeIsDark?IDI_CFGW:IDI_CFGB,g_hIconBtnConfig);
 
+    PreloadThemeIcons(dpi);
     if(g_hConfigMenu){
         for(auto hb:g_menuBitmaps) if(hb) DeleteObject(hb);
         g_menuBitmaps.clear();
@@ -314,6 +385,858 @@ static void ResetAboutFonts(UINT dpi){
 
     g_hAboutFont=CreateUiFont(dpi);
     GetAboutSmallFont();
+}
+
+#ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
+#define DWMWA_USE_IMMERSIVE_DARK_MODE 20
+#endif
+#ifndef DWMWA_BORDER_COLOR
+#define DWMWA_BORDER_COLOR 34
+#endif
+#ifndef DWMWA_CAPTION_COLOR
+#define DWMWA_CAPTION_COLOR 35
+#endif
+#ifndef DWMWA_TEXT_COLOR
+#define DWMWA_TEXT_COLOR 36
+#endif
+
+static bool IsSystemDarkMode(){
+    DWORD iValue=1;
+    DWORD iSize=sizeof(iValue);
+    if(SHGetValueW(
+           HKEY_CURRENT_USER,
+           L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+           L"AppsUseLightTheme",
+           nullptr,
+           &iValue,
+           &iSize
+       )==ERROR_SUCCESS){
+        return iValue==0;
+    }
+    return false;
+}
+
+static COLORREF BlendColor(COLORREF crA,COLORREF crB,int iAlpha);
+static COLORREF TintColor(COLORREF cr,int iPercent);
+
+static bool IsColorDark(COLORREF cr){
+    const int iR=GetRValue(cr);
+    const int iG=GetGValue(cr);
+    const int iB=GetBValue(cr);
+    const int iLuma=(iR*299+iG*587+iB*114)/1000;
+    return iLuma<128;
+}
+
+static void BuildThemeColors(bool bDark,ThemeColors& aColors){
+    if(!bDark){
+        aColors.crWindow=GetSysColor(COLOR_BTNFACE);
+        aColors.crWindowText=GetSysColor(COLOR_BTNTEXT);
+        aColors.crCaption=aColors.crWindow;
+        aColors.crCaptionText=aColors.crWindowText;
+        // Light theme: window bg light gray, edit bg white, button face white (system colors)
+        aColors.crControl=GetSysColor(COLOR_WINDOW);
+        aColors.crControlText=GetSysColor(COLOR_WINDOWTEXT);
+        aColors.crButtonFace=GetSysColor(COLOR_WINDOW);
+        aColors.crButtonText=GetSysColor(COLOR_BTNTEXT);
+        aColors.crControlHot=GetSysColor(COLOR_3DLIGHT);
+        aColors.crControlBorder=GetSysColor(COLOR_3DSHADOW);
+        aColors.crAccent=GetSysColor(COLOR_HIGHLIGHT);
+        aColors.crAccentText=GetSysColor(COLOR_HIGHLIGHTTEXT);
+        aColors.crMenu=GetSysColor(COLOR_MENU);
+        aColors.crMenuText=GetSysColor(COLOR_MENUTEXT);
+        aColors.crMenuSel=GetSysColor(COLOR_HIGHLIGHT);
+        aColors.crMenuSelText=GetSysColor(COLOR_HIGHLIGHTTEXT);
+        aColors.crTip=GetSysColor(COLOR_INFOBK);
+        aColors.crTipText=GetSysColor(COLOR_INFOTEXT);
+        return;
+    }
+
+    aColors.crWindow=RGB(32,32,32);
+    aColors.crWindowText=RGB(240,240,240);
+    aColors.crCaption=aColors.crWindow;
+    aColors.crCaptionText=aColors.crWindowText;
+    aColors.crControl=aColors.crWindow; // keep UI/control backgrounds consistent
+    aColors.crControlText=RGB(240,240,240);
+    aColors.crButtonFace=aColors.crControl;
+    aColors.crButtonText=aColors.crControlText;
+    aColors.crControlHot=RGB(64,64,64);
+    aColors.crControlBorder=RGB(90,90,90);
+    aColors.crAccent=RGB(0,120,215);
+    aColors.crAccentText=RGB(255,255,255);
+    aColors.crMenu=RGB(40,40,40);
+    aColors.crMenuText=RGB(240,240,240);
+    aColors.crMenuSel=RGB(0,120,215);
+    aColors.crMenuSelText=RGB(255,255,255);
+    aColors.crTip=RGB(45,45,45);
+    aColors.crTipText=RGB(240,240,240);
+}
+
+static ThemeColors BuildThemeColorsFromPalette(const CtThemePalette& aPalette){
+    ThemeColors aOut{};
+    aOut.crWindow=aPalette.appBg;
+    aOut.crWindowText=aPalette.buttonText;
+    aOut.crCaption=aPalette.borderActive;
+    aOut.crCaptionText=aPalette.appText;
+    aOut.crControl=aPalette.windowBg;
+    aOut.crControlText=aPalette.windowText;
+    aOut.crButtonFace=aPalette.buttonBg;
+    aOut.crButtonText=aPalette.buttonText;
+    aOut.crControlHot=TintColor(aOut.crButtonFace,aPalette.dark?10:-10);
+    aOut.crControlBorder=aPalette.borderInactive;
+    if(aOut.crControlBorder==aOut.crWindow){
+        aOut.crControlBorder=BlendColor(aOut.crWindow,aPalette.dark?RGB(255,255,255):RGB(0,0,0),35);
+    }
+    aOut.crAccent=aPalette.selBg;
+    aOut.crAccentText=aPalette.selText;
+    aOut.crMenu=aPalette.menuBg;
+    aOut.crMenuText=aPalette.menuText;
+    aOut.crMenuSel=aPalette.selBg;
+    aOut.crMenuSelText=aPalette.selText;
+    aOut.crTip=aPalette.tipBg;
+    aOut.crTipText=aPalette.tipText;
+    return aOut;
+}
+
+static bool HasCustomThemeName(const std::wstring& aName){
+    for(const auto& vTheme:g_aCustomThemes){
+        if(_wcsicmp(vTheme.name.c_str(),aName.c_str())==0){
+            return true;
+        }
+    }
+    return false;
+}
+
+static void LoadPresetThemesFromHeader(){
+    for(int i=0;i<g_ctThemeCatalogCount;i++){
+        const CtThemeDef& def=g_ctThemeCatalog[i];
+        if(!def.name||!def.name[0]) continue;
+        const std::wstring vName=def.name;
+        if(vName.rfind(L"Default",0)==0) continue;
+        if(HasCustomThemeName(vName)) continue;
+
+        ThemeEntry entry{};
+        entry.name=vName;
+        entry.colors=BuildThemeColorsFromPalette(def.p);
+        entry.dark=def.p.dark?true:IsColorDark(entry.colors.crWindow);
+        g_aCustomThemes.push_back(std::move(entry));
+    }
+}
+
+static void LoadBakedThemesFromHeader(){
+    g_aCustomThemes.clear();
+    LoadPresetThemesFromHeader();
+}
+
+static void ClearThemeBrushes(){
+    if(g_hbrThemeWindow){ DeleteObject(g_hbrThemeWindow); g_hbrThemeWindow=nullptr; }
+    if(g_hbrThemeControl){ DeleteObject(g_hbrThemeControl); g_hbrThemeControl=nullptr; }
+    if(g_hbrThemeButton){ DeleteObject(g_hbrThemeButton); g_hbrThemeButton=nullptr; }
+    if(g_hbrThemeControlHot){ DeleteObject(g_hbrThemeControlHot); g_hbrThemeControlHot=nullptr; }
+    if(g_hbrThemeMenu){ DeleteObject(g_hbrThemeMenu); g_hbrThemeMenu=nullptr; }
+    if(g_hbrThemeMenuSel){ DeleteObject(g_hbrThemeMenuSel); g_hbrThemeMenuSel=nullptr; }
+    if(g_hbrThemeBorder){ DeleteObject(g_hbrThemeBorder); g_hbrThemeBorder=nullptr; }
+    if(g_hbrThemeIconPreview){ DeleteObject(g_hbrThemeIconPreview); g_hbrThemeIconPreview=nullptr; }
+}
+
+static void UpdateThemeBrushes(){
+    ClearThemeBrushes();
+    g_hbrThemeWindow=CreateSolidBrush(g_themeColors.crWindow);
+    g_hbrThemeControl=CreateSolidBrush(g_themeColors.crControl);
+    g_hbrThemeButton=CreateSolidBrush(g_themeColors.crButtonFace);
+    g_hbrThemeControlHot=CreateSolidBrush(g_themeColors.crControlHot);
+    g_hbrThemeMenu=CreateSolidBrush(g_themeColors.crMenu);
+    g_hbrThemeMenuSel=CreateSolidBrush(g_themeColors.crMenuSel);
+    g_hbrThemeBorder=CreateSolidBrush(g_themeColors.crControlBorder);
+    const COLORREF crIconBg=TintColor(g_themeColors.crWindow,g_bThemeIsDark?12:-8);
+    g_hbrThemeIconPreview=CreateSolidBrush(crIconBg);
+}
+
+static COLORREF BlendColor(COLORREF crA,COLORREF crB,int iAlpha){
+    const int iInv=100-iAlpha;
+    const int iR=(GetRValue(crA)*iInv+GetRValue(crB)*iAlpha)/100;
+    const int iG=(GetGValue(crA)*iInv+GetGValue(crB)*iAlpha)/100;
+    const int iB=(GetBValue(crA)*iInv+GetBValue(crB)*iAlpha)/100;
+    return RGB(iR,iG,iB);
+}
+
+static COLORREF TintColor(COLORREF cr,int iPercent){
+    if(iPercent==0) return cr;
+    const COLORREF crTarget=(iPercent>0)?RGB(255,255,255):RGB(0,0,0);
+    const int iAlpha=(iPercent<0)?-iPercent:iPercent;
+    return BlendColor(cr,crTarget,iAlpha);
+}
+
+static COLORREF ScaleColor(COLORREF cr,int iNum,int iDen){
+    if(iDen<=0) return cr;
+    const int iR=GetRValue(cr)*iNum/iDen;
+    const int iG=GetGValue(cr)*iNum/iDen;
+    const int iB=GetBValue(cr)*iNum/iDen;
+    return RGB(iR,iG,iB);
+}
+
+static COLORREF AdjustButtonFaceForContrast(COLORREF crFace,COLORREF crBg){
+    if(crFace==crBg){
+        return TintColor(crFace,25); // lighten for contrast
+    }
+    return crFace;
+}
+
+
+static void AddRoundRectPath(Gdiplus::GraphicsPath& path,const Gdiplus::RectF& rc,float radius){
+    const float fDiameter=radius*2.0f;
+    if(fDiameter<=0.0f){
+        path.AddRectangle(rc);
+        return;
+    }
+    Gdiplus::RectF rcArc(rc.X,rc.Y,fDiameter,fDiameter);
+    path.AddArc(rcArc,180.0f,90.0f);
+    rcArc.X=rc.X+rc.Width-fDiameter;
+    path.AddArc(rcArc,270.0f,90.0f);
+    rcArc.Y=rc.Y+rc.Height-fDiameter;
+    path.AddArc(rcArc,0.0f,90.0f);
+    rcArc.X=rc.X;
+    path.AddArc(rcArc,90.0f,90.0f);
+    path.CloseFigure();
+}
+
+static void DrawRoundedRect(HDC hdc,const RECT& rc,COLORREF crFill,COLORREF crBorder,int iRadius){
+    if(!hdc) return;
+    Gdiplus::Graphics g(hdc);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    const Gdiplus::RectF rf(
+        (Gdiplus::REAL)rc.left+0.5f,
+        (Gdiplus::REAL)rc.top+0.5f,
+        (Gdiplus::REAL)(rc.right-rc.left-1),
+        (Gdiplus::REAL)(rc.bottom-rc.top-1)
+    );
+    Gdiplus::GraphicsPath path;
+    AddRoundRectPath(path,rf,(Gdiplus::REAL)iRadius);
+    Gdiplus::SolidBrush brush(Gdiplus::Color(255,GetRValue(crFill),GetGValue(crFill),GetBValue(crFill)));
+    Gdiplus::Pen pen(Gdiplus::Color(255,GetRValue(crBorder),GetGValue(crBorder),GetBValue(crBorder)),1.0f);
+    g.FillPath(&brush,&path);
+    g.DrawPath(&pen,&path);
+}
+
+static void DrawIconPreviewBox(HDC hdc){
+    if(!hdc) return;
+
+    RECT rc=g_rcIconBox;
+    if(rc.right<=rc.left||rc.bottom<=rc.top) return;
+
+    const UINT dpi=g_uiDpi?g_uiDpi:USER_DEFAULT_SCREEN_DPI;
+    const int iBoxW=rc.right-rc.left;
+    const int iBoxH=rc.bottom-rc.top;
+
+    const COLORREF crWindow=g_themeColors.crWindow;
+    const int iBgLum=(GetRValue(crWindow)*299+GetGValue(crWindow)*587+GetBValue(crWindow)*114)/1000;
+    const bool bBgIsLight=iBgLum>=128;
+    const COLORREF crFill=BlendColor(
+        crWindow,
+        bBgIsLight ? RGB(0,0,0) : RGB(255,255,255),
+        10
+    );
+    const COLORREF crBorder=BlendColor(g_themeColors.crControlBorder,g_themeColors.crWindow,20);
+    const int iRadius=max(2,MulDiv(6,dpi,96));
+    DrawRoundedRect(hdc,rc,crFill,crBorder,iRadius);
+
+    const int iLblOffX=MulDiv(2,dpi,96);
+    const int iLblOffY=MulDiv(7,dpi,96);
+    const int iLblH=MulDiv(14,dpi,96);
+    RECT rcText=rc;
+    rcText.left+=iLblOffX+MulDiv(3,dpi,96);
+    rcText.top-=iLblOffY;
+    rcText.right-=iLblOffX+MulDiv(9,dpi,96);
+    rcText.bottom=rcText.top+iLblH;
+
+    const int iMid=(rcText.top+rcText.bottom)/2;
+    RECT rcTop=rcText;
+    rcTop.bottom=iMid;
+    RECT rcBot=rcText;
+    rcBot.top=iMid;
+    //rcBot.right-=;
+
+    HBRUSH hbrTop=CreateSolidBrush(g_themeColors.crWindow);
+    FillRect(hdc,&rcTop,hbrTop);
+    DeleteObject(hbrTop);
+
+    HBRUSH hbrBot=CreateSolidBrush(crFill);
+    FillRect(hdc,&rcBot,hbrBot);
+    DeleteObject(hbrBot);
+
+    HFONT hOldFont=(HFONT)SelectObject(hdc,g_hFont?g_hFont:GetStockObject(DEFAULT_GUI_FONT));
+    SetBkMode(hdc,TRANSPARENT);
+    SetTextColor(hdc,g_themeColors.crWindowText);
+    DrawTextW(hdc,L"Icon",-1,&rcText,DT_LEFT|DT_TOP|DT_SINGLELINE|DT_NOPREFIX);
+    SelectObject(hdc,hOldFont);
+
+    if(g_hIconPreviewHandle){
+        int iIconPx=MulDiv(32,dpi,96);
+        const int iMaxIcon=max(8,min(iBoxW,iBoxH)-MulDiv(16,dpi,96));
+        if(iIconPx>iMaxIcon) iIconPx=iMaxIcon;
+
+        int iIconX=rc.left+(iBoxW-iIconPx)/2;
+        int iIconY=rc.top+((iBoxH-iIconPx)/2);//;
+        const int iMinTop=rc.top+iLblH+MulDiv(2,dpi,96);
+        if(iIconY<iMinTop) iIconY=iMinTop;
+        const int iMaxTop=rc.bottom-MulDiv(2,dpi,96)-iIconPx;
+        if(iIconY>iMaxTop) iIconY=iMaxTop;
+        DrawIconEx(hdc,iIconX,iIconY-MulDiv(4,dpi,96),g_hIconPreviewHandle,iIconPx,iIconPx,0,nullptr,DI_NORMAL);
+    }
+}
+
+static void ApplyThemeToWindow(HWND hWnd){
+    if(!hWnd) return;
+
+    BOOL bDark=g_bThemeIsDark?TRUE:FALSE;
+    DwmSetWindowAttribute(hWnd,DWMWA_USE_IMMERSIVE_DARK_MODE,&bDark,sizeof(bDark));
+
+    const COLORREF crCaption=g_themeColors.crCaption;
+    const COLORREF crText=g_themeColors.crCaptionText;
+    const COLORREF crBorder=g_themeColors.crControlBorder;
+    DwmSetWindowAttribute(hWnd,DWMWA_CAPTION_COLOR,&crCaption,sizeof(crCaption));
+    DwmSetWindowAttribute(hWnd,DWMWA_TEXT_COLOR,&crText,sizeof(crText));
+    DwmSetWindowAttribute(hWnd,DWMWA_BORDER_COLOR,&crBorder,sizeof(crBorder));
+}
+
+static void PreloadThemeIcons(UINT dpi){
+    const int iPx=MulDiv(28,dpi,96);
+
+    if(g_hIconColorLight){ DestroyIcon(g_hIconColorLight); g_hIconColorLight=nullptr; }
+    if(g_hIconColorDark){ DestroyIcon(g_hIconColorDark); g_hIconColorDark=nullptr; }
+    if(g_hBmpColorLight){ DeleteObject(g_hBmpColorLight); g_hBmpColorLight=nullptr; }
+    if(g_hBmpColorDark){ DeleteObject(g_hBmpColorDark); g_hBmpColorDark=nullptr; }
+
+    g_hIconColorLight=LoadIconResBestDownscale(g_hInst,IDI_COLRB,iPx,iPx);
+    g_hIconColorDark=LoadIconResBestDownscale(g_hInst,IDI_COLRW,iPx,iPx);
+
+    if(g_hIconColorLight) g_hBmpColorLight=IconToMenuBitmap(g_hIconColorLight,iPx,iPx);
+    if(g_hIconColorDark)  g_hBmpColorDark=IconToMenuBitmap(g_hIconColorDark,iPx,iPx);
+}
+
+static HBITMAP GetThemeColorMenuBitmap(){
+    return g_bThemeIsDark?g_hBmpColorDark:g_hBmpColorLight;
+}
+
+static void UpdateTooltipColors(){
+    COLORREF crTipBk=g_themeColors.crTip;
+    COLORREF crTipText=g_themeColors.crTipText;
+    if(g_hValidationTooltip){
+        SendMessageW(g_hValidationTooltip,TTM_SETTIPBKCOLOR,crTipBk,0);
+        SendMessageW(g_hValidationTooltip,TTM_SETTIPTEXTCOLOR,crTipText,0);
+    }
+    if(g_hMenuTip){
+        SendMessageW(g_hMenuTip,TTM_SETTIPBKCOLOR,crTipBk,0);
+        SendMessageW(g_hMenuTip,TTM_SETTIPTEXTCOLOR,crTipText,0);
+    }
+    if(g_hBtnTmpProfTip){
+        SendMessageW(g_hBtnTmpProfTip,TTM_SETTIPBKCOLOR,crTipBk,0);
+        SendMessageW(g_hBtnTmpProfTip,TTM_SETTIPTEXTCOLOR,crTipText,0);
+    }
+    if(g_hBtnConfigTip){
+        SendMessageW(g_hBtnConfigTip,TTM_SETTIPBKCOLOR,crTipBk,0);
+        SendMessageW(g_hBtnConfigTip,TTM_SETTIPTEXTCOLOR,crTipText,0);
+    }
+}
+
+static void InvalidateThemeWindows(){
+    const DWORD iTid=GetCurrentThreadId();
+    EnumThreadWindows(iTid,[](HWND hWnd,LPARAM)->BOOL{
+        ApplyThemeToWindow(hWnd);
+        InvalidateRect(hWnd,nullptr,TRUE);
+        EnumChildWindows(hWnd,[](HWND hChild,LPARAM)->BOOL{
+            InvalidateRect(hChild,nullptr,TRUE);
+            return TRUE;
+        },0);
+        return TRUE;
+    },0);
+}
+
+static void ApplyTheme(int iMode,bool bPreview){
+    if(!bPreview){
+        g_iThemeMode=iMode;
+    }
+
+    bool bDark=false;
+    if(iMode>=3){
+        const int iCustom=iMode-3;
+        if(iCustom>=0&&iCustom<(int)g_aCustomThemes.size()){
+            g_themeColors=g_aCustomThemes[iCustom].colors;
+            bDark=g_aCustomThemes[iCustom].dark;
+        } else{
+            bDark=(iMode==2)||(iMode==0&&IsSystemDarkMode());
+            BuildThemeColors(bDark,g_themeColors);
+        }
+    } else{
+        bDark=(iMode==2)||(iMode==0&&IsSystemDarkMode());
+        BuildThemeColors(bDark,g_themeColors);
+    }
+    g_bThemeIsDark=bDark;
+    UpdateThemeBrushes();
+    UpdateTooltipColors();
+    ProgressUI_SetTheme(
+        g_themeColors.crWindow,
+        g_themeColors.crWindowText,
+        g_themeColors.crAccent,
+        g_themeColors.crControl,
+        bDark
+    );
+    SetButtonIcon(g_hBtnTmpProf,bDark?IDI_TEMPW:IDI_TEMPB,g_hIconBtnTemp);
+    SetButtonIcon(g_hBtnConfig,bDark?IDI_CFGW:IDI_CFGB,g_hIconBtnConfig);
+
+    InvalidateThemeWindows();
+
+    if(g_hConfigMenu){
+        for(auto hb:g_menuBitmaps) if(hb) DeleteObject(hb);
+        g_menuBitmaps.clear();
+        ClearMenuItemData();
+        DestroyMenu(g_hConfigMenu);
+        g_hConfigMenu=nullptr;
+        EnsureConfigMenu(g_hGui);
+    }
+
+    InvalidateRect(g_hGui,&g_rcIconBox,TRUE);
+    UpdateIconPreviewForSelection(true);
+}
+
+static HBRUSH HandleThemeCtlColor(UINT msg,HDC hdc,HWND hCtl){
+    if(!hdc) return (HBRUSH)GetSysColorBrush(COLOR_BTNFACE);
+
+    switch(msg){
+    case WM_CTLCOLORDLG:
+        SetTextColor(hdc,g_themeColors.crWindowText);
+        SetBkColor(hdc,g_themeColors.crWindow);
+        return g_hbrThemeWindow?g_hbrThemeWindow:(HBRUSH)GetSysColorBrush(COLOR_BTNFACE);
+    case WM_CTLCOLORSTATIC:
+        if(hCtl==g_hIconPreview){
+            const COLORREF crIconBg=TintColor(g_themeColors.crWindow,g_bThemeIsDark?12:-8);
+            SetTextColor(hdc,g_themeColors.crWindowText);
+            SetBkColor(hdc,crIconBg);
+            SetBkMode(hdc,OPAQUE);
+            return g_hbrThemeIconPreview?g_hbrThemeIconPreview:(HBRUSH)GetSysColorBrush(COLOR_BTNFACE);
+        }
+        SetTextColor(hdc,g_themeColors.crWindowText);
+        SetBkColor(hdc,g_themeColors.crWindow);
+        SetBkMode(hdc,TRANSPARENT);
+        return g_hbrThemeWindow?g_hbrThemeWindow:(HBRUSH)GetSysColorBrush(COLOR_BTNFACE);
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORLISTBOX:
+        SetTextColor(hdc,g_themeColors.crControlText);
+        SetBkColor(hdc,g_themeColors.crControl);
+        return g_hbrThemeControl?g_hbrThemeControl:(HBRUSH)GetSysColorBrush(COLOR_WINDOW);
+    case WM_CTLCOLORBTN:
+        SetTextColor(hdc,g_themeColors.crButtonText);
+        SetBkColor(hdc,g_themeColors.crButtonFace);
+        return g_hbrThemeButton?g_hbrThemeButton:(HBRUSH)GetSysColorBrush(COLOR_BTNFACE);
+    default:
+        break;
+    }
+    return g_hbrThemeWindow?g_hbrThemeWindow:(HBRUSH)GetSysColorBrush(COLOR_BTNFACE);
+}
+
+static void DrawThemedComboFrame(HWND hCombo){
+    if(!hCombo) return;
+    HDC hdc=GetWindowDC(hCombo);
+    if(!hdc) return;
+
+    RECT rcWnd{};
+    GetWindowRect(hCombo,&rcWnd);
+    OffsetRect(&rcWnd,-rcWnd.left,-rcWnd.top);
+
+    const bool bDisabled=!IsWindowEnabled(hCombo);
+    const bool bFocused=(GetFocus()==hCombo)||IsChild(hCombo,GetFocus());
+    const COLORREF crBorder=bDisabled
+        ?BlendColor(g_themeColors.crControlBorder,g_themeColors.crWindow,50)
+        :(bFocused?g_themeColors.crAccent:g_themeColors.crControlBorder);
+
+    HPEN hPen=CreatePen(PS_SOLID,1,crBorder);
+    HGDIOBJ hOldPen=SelectObject(hdc,hPen);
+    HGDIOBJ hOldBrush=SelectObject(hdc,GetStockObject(NULL_BRUSH));
+    Rectangle(hdc,rcWnd.left,rcWnd.top,rcWnd.right,rcWnd.bottom);
+    SelectObject(hdc,hOldBrush);
+    SelectObject(hdc,hOldPen);
+    DeleteObject(hPen);
+
+    COMBOBOXINFO cbi{};
+    cbi.cbSize=sizeof(cbi);
+    if(GetComboBoxInfo(hCombo,&cbi)){
+        RECT rcBtn=cbi.rcButton;
+        MapWindowPoints(nullptr,hCombo,(LPPOINT)&rcBtn,2);
+        InflateRect(&rcBtn,-1,-1);
+
+        const bool bDropped=SendMessageW(hCombo,CB_GETDROPPEDSTATE,0,0)!=0;
+        const COLORREF crBtnFill=bDropped?g_themeColors.crControlHot:g_themeColors.crControl;
+        const COLORREF crArrow=bDisabled
+            ?BlendColor(g_themeColors.crControlText,g_themeColors.crWindowText,50)
+            :g_themeColors.crControlText;
+
+        HBRUSH hbrBtn=CreateSolidBrush(crBtnFill);
+        FillRect(hdc,&rcBtn,hbrBtn);
+        DeleteObject(hbrBtn);
+
+        HPEN hSepPen=CreatePen(PS_SOLID,1,crBorder);
+        HGDIOBJ hOldSep=SelectObject(hdc,hSepPen);
+        MoveToEx(hdc,rcBtn.left,rcBtn.top,nullptr);
+        LineTo(hdc,rcBtn.left,rcBtn.bottom);
+        SelectObject(hdc,hOldSep);
+        DeleteObject(hSepPen);
+
+        const int iBtnW=rcBtn.right-rcBtn.left;
+        const int iBtnH=rcBtn.bottom-rcBtn.top;
+        const int iArrowW=max(4,iBtnW/4);
+        const int iArrowH=max(3,iBtnH/5);
+        const int iCx=rcBtn.left+iBtnW/2;
+        const int iCy=rcBtn.top+iBtnH/2;
+        POINT pts[3]{
+            {iCx-iArrowW/2,iCy-iArrowH/2},
+            {iCx+iArrowW/2,iCy-iArrowH/2},
+            {iCx,iCy+iArrowH/2}
+        };
+        HPEN hArrowPen=CreatePen(PS_SOLID,1,crArrow);
+        HBRUSH hArrowBrush=CreateSolidBrush(crArrow);
+        HGDIOBJ hOldArrowPen=SelectObject(hdc,hArrowPen);
+        HGDIOBJ hOldArrowBrush=SelectObject(hdc,hArrowBrush);
+        Polygon(hdc,pts,3);
+        SelectObject(hdc,hOldArrowBrush);
+        SelectObject(hdc,hOldArrowPen);
+        DeleteObject(hArrowBrush);
+        DeleteObject(hArrowPen);
+    }
+
+    ReleaseDC(hCombo,hdc);
+}
+
+static LRESULT CALLBACK ComboThemeSubclassProc(HWND hWnd,UINT msg,WPARAM wParam,LPARAM lParam,
+                                               UINT_PTR uIdSubclass,DWORD_PTR /*dwRefData*/){
+    switch(msg){
+    case WM_NCDESTROY:
+        RemoveWindowSubclass(hWnd,ComboThemeSubclassProc,uIdSubclass);
+        break;
+    case WM_PAINT:
+    case WM_NCPAINT: {
+        LRESULT lRes=DefSubclassProc(hWnd,msg,wParam,lParam);
+        DrawThemedComboFrame(hWnd);
+        return lRes;
+    }
+    case WM_SETFOCUS:
+    case WM_KILLFOCUS:
+    case WM_ENABLE:
+    case CB_SHOWDROPDOWN: {
+        LRESULT lRes=DefSubclassProc(hWnd,msg,wParam,lParam);
+        InvalidateRect(hWnd,nullptr,TRUE);
+        return lRes;
+    }
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORLISTBOX:
+    case WM_CTLCOLORSTATIC: {
+        HDC hdc=(HDC)wParam;
+        SetTextColor(hdc,g_themeColors.crControlText);
+        SetBkColor(hdc,g_themeColors.crControl);
+        return (LRESULT)(g_hbrThemeControl?g_hbrThemeControl:(HBRUSH)GetSysColorBrush(COLOR_WINDOW));
+    }
+    default:
+        break;
+    }
+    return DefSubclassProc(hWnd,msg,wParam,lParam);
+}
+
+static void ApplyComboTheme(HWND hCombo){
+    if(!hCombo) return;
+    SetWindowSubclass(hCombo,ComboThemeSubclassProc,1,0);
+    InvalidateRect(hCombo,nullptr,TRUE);
+}
+
+static LRESULT CALLBACK ButtonHotSubclassProc(HWND hWnd,UINT msg,WPARAM wParam,LPARAM lParam,
+                                              UINT_PTR uIdSubclass,DWORD_PTR /*dwRefData*/){
+    switch(msg){
+    case WM_NCDESTROY:
+        if(g_hHotButton==hWnd) g_hHotButton=nullptr;
+        RemoveWindowSubclass(hWnd,ButtonHotSubclassProc,uIdSubclass);
+        break;
+    case WM_MOUSEMOVE: {
+        if(g_hHotButton!=hWnd){
+            HWND hPrev=g_hHotButton;
+            g_hHotButton=hWnd;
+            if(hPrev) InvalidateRect(hPrev,nullptr,TRUE);
+            InvalidateRect(hWnd,nullptr,TRUE);
+        }
+        TRACKMOUSEEVENT tme{sizeof(tme),TME_LEAVE,hWnd,0};
+        TrackMouseEvent(&tme);
+        break;
+    }
+    case WM_MOUSELEAVE:
+        if(g_hHotButton==hWnd){
+            g_hHotButton=nullptr;
+            InvalidateRect(hWnd,nullptr,TRUE);
+        }
+        break;
+    default:
+        break;
+    }
+    return DefSubclassProc(hWnd,msg,wParam,lParam);
+}
+
+static void DrawThemedMenuItem(const DRAWITEMSTRUCT& ds){
+    auto* vData=reinterpret_cast<MenuItemData*>(ds.itemData);
+    if(!vData) return;
+
+    const bool bSelected=(ds.itemState&ODS_SELECTED)!=0;
+    const bool bDisabled=(ds.itemState&ODS_DISABLED)!=0;
+
+    if(vData->separator){
+        HBRUSH hbrBg=g_hbrThemeMenu?g_hbrThemeMenu:(HBRUSH)GetSysColorBrush(COLOR_MENU);
+        FillRect(ds.hDC,&ds.rcItem,hbrBg);
+        const int iCy=(ds.rcItem.top+ds.rcItem.bottom)/2;
+        HPEN hPen=CreatePen(PS_SOLID,1,g_themeColors.crControlBorder);
+        HGDIOBJ hOldPen=SelectObject(ds.hDC,hPen);
+        MoveToEx(ds.hDC,ds.rcItem.left+4,iCy,nullptr);
+        LineTo(ds.hDC,ds.rcItem.right-4,iCy);
+        SelectObject(ds.hDC,hOldPen);
+        DeleteObject(hPen);
+        return;
+    }
+
+    HBRUSH hbrBg=bSelected?g_hbrThemeMenuSel:g_hbrThemeMenu;
+    FillRect(ds.hDC,&ds.rcItem,hbrBg?hbrBg:(HBRUSH)GetSysColorBrush(COLOR_MENU));
+
+    const UINT dpi=g_hGui?GetDpiForWindow(g_hGui):96;
+    const int iPad=MulDiv(6,dpi,96);
+    const int iIconPad=MulDiv(6,dpi,96);
+    const int iIconPx=(g_iMenuIconPx>0)?g_iMenuIconPx:MulDiv(20,dpi,96);
+
+    RECT rcIcon=ds.rcItem;
+    rcIcon.left+=iPad;
+    rcIcon.right=rcIcon.left+iIconPx;
+    rcIcon.top+=((ds.rcItem.bottom-ds.rcItem.top)-iIconPx)/2;
+    rcIcon.bottom=rcIcon.top+iIconPx;
+
+    if(vData->hIcon){
+        if(bDisabled){
+            DrawStateW(ds.hDC,nullptr,nullptr,(LPARAM)vData->hIcon,0,
+                       rcIcon.left,rcIcon.top,iIconPx,iIconPx,DST_ICON|DSS_DISABLED);
+        } else{
+            DrawIconEx(ds.hDC,rcIcon.left,rcIcon.top,vData->hIcon,iIconPx,iIconPx,0,nullptr,DI_NORMAL);
+        }
+    }
+
+    RECT rcText=ds.rcItem;
+    rcText.left=rcIcon.right+iIconPad;
+    const COLORREF crText=bDisabled
+        ?BlendColor(g_themeColors.crMenuText,g_themeColors.crMenu,60)
+        :(bSelected?g_themeColors.crMenuSelText:g_themeColors.crMenuText);
+    HFONT hOldFont=(HFONT)SelectObject(ds.hDC,g_hFont?g_hFont:GetStockObject(DEFAULT_GUI_FONT));
+    SetBkMode(ds.hDC,TRANSPARENT);
+    SetTextColor(ds.hDC,crText);
+    DrawTextW(ds.hDC,vData->text.c_str(),-1,&rcText,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    SelectObject(ds.hDC,hOldFont);
+}
+
+static void MeasureThemedMenuItem(MEASUREITEMSTRUCT& ms){
+    auto* vData=reinterpret_cast<MenuItemData*>(ms.itemData);
+    if(!vData) return;
+
+    const UINT dpi=g_hGui?GetDpiForWindow(g_hGui):96;
+    const int iPad=MulDiv(6,dpi,96);
+    const int iIconPad=MulDiv(6,dpi,96);
+    const int iIconPx=(g_iMenuIconPx>0)?g_iMenuIconPx:MulDiv(20,dpi,96);
+
+    if(vData->separator){
+        ms.itemHeight=MulDiv(8,dpi,96);
+        ms.itemWidth=MulDiv(40,dpi,96);
+        if(g_iMenuMinWidth>0){
+            ms.itemWidth=max(ms.itemWidth,(UINT)g_iMenuMinWidth);
+        }
+        return;
+    }
+
+    SIZE szText{};
+    HDC hdc=GetDC(nullptr);
+    HFONT hOld=(HFONT)SelectObject(hdc,g_hFont?g_hFont:GetStockObject(DEFAULT_GUI_FONT));
+    GetTextExtentPoint32W(hdc,vData->text.c_str(),(int)vData->text.size(),&szText);
+    SelectObject(hdc,hOld);
+    ReleaseDC(nullptr,hdc);
+
+    ms.itemHeight=max((UINT)(iIconPx+iPad*2),(UINT)MulDiv(22,dpi,96));
+    ms.itemWidth=(UINT)(iPad+iIconPx+iIconPad+szText.cx+iPad);
+    ms.itemWidth+=(UINT)MulDiv(120,dpi,96);
+    if(g_iMenuMinWidth>0){
+        ms.itemWidth=max(ms.itemWidth,(UINT)g_iMenuMinWidth);
+    }
+}
+
+static void DrawThemedButtonCore(HDC hdc,const RECT& rc,int iId,UINT itemState,HWND hWndItem){
+    const bool bDisabled=(itemState&ODS_DISABLED)!=0;
+    const bool bPressed=(itemState&ODS_SELECTED)!=0;
+    const bool bHot=(itemState&ODS_HOTLIGHT)!=0||(hWndItem&&hWndItem==g_hHotButton);
+    const bool bFocus=(itemState&ODS_FOCUS)!=0;
+    const bool bDefault=(itemState&ODS_DEFAULT)!=0;
+
+    COLORREF crButtonFace=AdjustButtonFaceForContrast(g_themeColors.crButtonFace,g_themeColors.crWindow);
+    crButtonFace=TintColor(crButtonFace,g_bThemeIsDark?10:-10);
+    COLORREF crFill=bDefault?g_themeColors.crAccent:crButtonFace;
+    COLORREF crText=bDefault?g_themeColors.crAccentText:g_themeColors.crButtonText;
+    COLORREF crBorder=bDefault?g_themeColors.crAccent:g_themeColors.crControlBorder;
+
+    if(bHot){
+        crFill=bDefault?TintColor(crFill,g_bThemeIsDark?10:-8):g_themeColors.crControlHot;
+    }
+    if(bPressed){
+        crFill=TintColor(crFill,g_bThemeIsDark?-12:-12);
+    }
+    if(bDisabled){
+        crFill=BlendColor(crFill,g_themeColors.crWindow,50);
+        crText=BlendColor(crText,g_themeColors.crWindowText,60);
+        crBorder=BlendColor(crBorder,g_themeColors.crWindow,50);
+    }
+
+    // Fill background to avoid dark corners when using rounded rects on a memory DC
+    {
+        HBRUSH hbrBg=CreateSolidBrush(g_themeColors.crWindow);
+        FillRect(hdc,&rc,hbrBg);
+        DeleteObject(hbrBg);
+    }
+
+    const UINT dpi=GetDpiForWindow(hWndItem);
+    const int iRadius=min(MulDiv(6,dpi,96),max(2,(rc.right-rc.left)/6));
+    DrawRoundedRect(hdc,rc,crFill,crBorder,iRadius);
+
+    HICON hIcon=nullptr;
+    if(iId==IDC_BTN_TEMP) hIcon=g_hIconBtnTemp;
+    if(iId==IDC_BTN_CONFIG) hIcon=g_hIconBtnConfig;
+
+    HFONT hOldFont=(HFONT)SelectObject(hdc,g_hFont?g_hFont:GetStockObject(DEFAULT_GUI_FONT));
+    if(hIcon){
+        int iW=0,iH=0;
+        if(GetIconSizePx(hIcon,iW,iH)){
+            const int iX=rc.left+(rc.right-rc.left-iW)/2;
+            const int iY=rc.top+(rc.bottom-rc.top-iH)/2;
+            DrawIconEx(hdc,iX,iY,hIcon,iW,iH,0,nullptr,DI_NORMAL);
+        }
+    } else{
+        wchar_t wszText[128]{};
+        GetWindowTextW(hWndItem,wszText,(int)(sizeof(wszText)/sizeof(wchar_t)));
+        SetBkMode(hdc,TRANSPARENT);
+        SetTextColor(hdc,crText);
+        DrawTextW(hdc,wszText,-1,const_cast<RECT*>(&rc),
+                  DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    }
+    SelectObject(hdc,hOldFont);
+
+    if(bFocus){
+        RECT rcFocus=rc;
+        InflateRect(&rcFocus,-3,-3);
+        DrawFocusRect(hdc,&rcFocus);
+    }
+}
+
+static void DrawOwnerDrawItem(const DRAWITEMSTRUCT& ds){
+    if(ds.CtlType==ODT_BUTTON){
+        const int iId=static_cast<int>(ds.CtlID);
+        const bool bIsGroup=(iId==IDC_GRP_ICON);
+
+        if(bIsGroup){
+            const UINT dpi=GetDpiForWindow(ds.hwndItem);
+            RECT rc=ds.rcItem;
+            InflateRect(&rc,-1,-1);
+            const int iRadius=min(MulDiv(6,dpi,96),max(2,(rc.right-rc.left)/6));
+            HPEN hPen=CreatePen(PS_SOLID,1,g_themeColors.crControlBorder);
+            HGDIOBJ hOldPen=SelectObject(ds.hDC,hPen);
+            HGDIOBJ hOldBrush=SelectObject(ds.hDC,GetStockObject(HOLLOW_BRUSH));
+            RoundRect(ds.hDC,rc.left,rc.top,rc.right,rc.bottom,iRadius*2,iRadius*2);
+            SelectObject(ds.hDC,hOldBrush);
+            SelectObject(ds.hDC,hOldPen);
+            DeleteObject(hPen);
+            return;
+        }
+
+        const int w=ds.rcItem.right-ds.rcItem.left;
+        const int h=ds.rcItem.bottom-ds.rcItem.top;
+        if(w<=0||h<=0) return;
+
+        HDC memDC=CreateCompatibleDC(ds.hDC);
+        HBITMAP memBmp=CreateCompatibleBitmap(ds.hDC,w,h);
+        HGDIOBJ oldBmp=SelectObject(memDC,memBmp);
+
+        RECT rcLocal{0,0,w,h};
+        DrawThemedButtonCore(memDC,rcLocal,iId,ds.itemState,ds.hwndItem);
+        BitBlt(ds.hDC,ds.rcItem.left,ds.rcItem.top,w,h,memDC,0,0,SRCCOPY);
+
+        SelectObject(memDC,oldBmp);
+        DeleteObject(memBmp);
+        DeleteDC(memDC);
+        return;
+    }
+
+    if(ds.CtlType==ODT_STATIC){
+        if(ds.CtlID!=IDC_ICON_PREVIEW) return;
+
+        const int w=ds.rcItem.right-ds.rcItem.left;
+        const int h=ds.rcItem.bottom-ds.rcItem.top;
+        if(w<=0||h<=0) return;
+
+        HDC memDC=CreateCompatibleDC(ds.hDC);
+        HBITMAP memBmp=CreateCompatibleBitmap(ds.hDC,w,h);
+        HGDIOBJ oldBmp=SelectObject(memDC,memBmp);
+
+        RECT rcLocal{0,0,w,h};
+        HBRUSH hbrBg=g_hbrThemeIconPreview?g_hbrThemeIconPreview:(HBRUSH)GetSysColorBrush(COLOR_BTNFACE);
+        FillRect(memDC,&rcLocal,hbrBg);
+
+        if(g_hIconPreviewHandle){
+            int iW=0,iH=0;
+            if(GetIconSizePx(g_hIconPreviewHandle,iW,iH)){
+                const int iX=(w-iW)/2;
+                const int iY=(h-iH)/2;
+                DrawIconEx(memDC,iX,iY,g_hIconPreviewHandle,iW,iH,0,nullptr,DI_NORMAL);
+            }
+        }
+
+        BitBlt(ds.hDC,ds.rcItem.left,ds.rcItem.top,w,h,memDC,0,0,SRCCOPY);
+        SelectObject(memDC,oldBmp);
+        DeleteObject(memBmp);
+        DeleteDC(memDC);
+        return;
+    }
+
+    if(ds.CtlType==ODT_MENU){
+        DrawThemedMenuItem(ds);
+        return;
+    }
+
+    if(ds.CtlType==ODT_COMBOBOX){
+        if(ds.itemID==(UINT)-1) return;
+
+        if(g_hThemeCombo&&ds.hwndItem==g_hThemeCombo&&ds.itemID==(UINT)g_iThemeSeparatorIndex){
+            FillRect(ds.hDC,&ds.rcItem,g_hbrThemeWindow?g_hbrThemeWindow:(HBRUSH)GetSysColorBrush(COLOR_BTNFACE));
+            const int iCy=(ds.rcItem.top+ds.rcItem.bottom)/2;
+            HPEN hPen=CreatePen(PS_SOLID,1,g_themeColors.crControlBorder);
+            HGDIOBJ hOld=SelectObject(ds.hDC,hPen);
+            MoveToEx(ds.hDC,ds.rcItem.left+4,iCy,nullptr);
+            LineTo(ds.hDC,ds.rcItem.right-4,iCy);
+            SelectObject(ds.hDC,hOld);
+            DeleteObject(hPen);
+            return;
+        }
+
+        const bool bSelected=(ds.itemState&ODS_SELECTED)!=0;
+        HBRUSH hbrFill=bSelected?g_hbrThemeMenuSel:g_hbrThemeControl;
+        FillRect(ds.hDC,&ds.rcItem,hbrFill?hbrFill:(HBRUSH)GetSysColorBrush(COLOR_WINDOW));
+
+        wchar_t wszText[256]{};
+        SendMessageW(ds.hwndItem,CB_GETLBTEXT,ds.itemID,(LPARAM)wszText);
+        SetBkMode(ds.hDC,TRANSPARENT);
+        SetTextColor(ds.hDC,bSelected?g_themeColors.crMenuSelText:g_themeColors.crControlText);
+
+        RECT rcText=ds.rcItem;
+        rcText.left+=ScaleByDpi(6,g_uiDpi);
+        DrawTextW(ds.hDC,wszText,-1,&rcText,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+
+        if(ds.itemState&ODS_FOCUS){
+            RECT rcFocus=ds.rcItem;
+            InflateRect(&rcFocus,-2,-2);
+            DrawFocusRect(ds.hDC,&rcFocus);
+        }
+        return;
+    }
 }
 
 struct _7zUiCtx{
@@ -490,11 +1413,14 @@ void GuiProfDel();
 inline void EnsureMouseVisible();
 inline void FocusClientEdit();
 static void ShowAboutDialog();
+static void ShowThemeDialog();
+static INT_PTR CALLBACK ThemeDlgProc(HWND hDlg,UINT msg,WPARAM wParam,LPARAM lParam);
+static HBRUSH HandleThemeCtlColor(UINT msg,HDC hdc,HWND hCtl);
+static void DrawOwnerDrawItem(const DRAWITEMSTRUCT& ds);
 static UINT ShowConfigMenuFromButton(HWND hWnd);
 static int IcoDim(BYTE b){return (b==0)?256:(int)b;}
 static HICON  LoadIconResBestDownscale(HINSTANCE hInst,int groupIconResId,int cxDesired,int cyDesired);
 static HICON  LoadIconFromIcoBestDownscale(const fs::path& icoPath,int pxDesired);
-static HBITMAP LoadMenuBitmapFromIconRes(int iconResId,UINT dpi,int cx,int cy);
 static HFONT CreateSmallerFontFrom(HFONT baseFont,int pxHeight,UINT dpi);
 static HICON ScaleIconDown_HQ(HICON hSrc,int dstCx,int dstCy);
 static bool GetIconSizePx(HICON hIcon,int& w,int& h);
@@ -664,7 +1590,7 @@ BOOL InitInstance(HINSTANCE hInstance,int nCmdShow){
     const int guiClientH=ScaleByDpi(baseGuiH,dpi);
     RECT wr{0,0,guiClientW,guiClientH};
 
-    const DWORD style=WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX;
+    const DWORD style=WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX|WS_CLIPCHILDREN;
     const DWORD exStyle=0;
     auto adjustForDpi=reinterpret_cast<BOOL (WINAPI*)(LPRECT,DWORD,BOOL,DWORD,UINT)>(
         GetProcAddress(GetModuleHandleW(L"user32.dll"),"AdjustWindowRectExForDpi")
@@ -702,8 +1628,6 @@ BOOL InitInstance(HINSTANCE hInstance,int nCmdShow){
         SendMessage(g_hGui,WM_SETICON,ICON_BIG,(LPARAM)hAppIcon);
         SendMessage(g_hGui,WM_SETICON,ICON_SMALL,(LPARAM)hAppIcon);
     }
-    BOOL isDarkMode=TRUE;
-    DwmSetWindowAttribute(g_hGui,DWMWA_USE_IMMERSIVE_DARK_MODE,&isDarkMode,sizeof(isDarkMode));
     CreateWindowW(L"STATIC",L"Select or type the client name:",WS_CHILD|WS_VISIBLE,iGuiM,iGuiM,iGuiCtrlW,labelH,g_hGui,(HMENU)101,hInstance,nullptr);
     g_hValidationTooltip=CreateWindowEx(WS_EX_TOPMOST,TOOLTIPS_CLASS,NULL,TTS_BALLOON|TTS_NOPREFIX|TTS_ALWAYSTIP,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,g_hGui,NULL,g_hInst,NULL);
     SendMessageW(g_hGui,WM_SETFONT,(WPARAM)g_hFont,TRUE);
@@ -735,29 +1659,32 @@ BOOL InitInstance(HINSTANCE hInstance,int nCmdShow){
     g_hBtnConfigTip=CreateToolTip(g_hBtnConfig,g_hGui,(LPWSTR)L"Options / Profile actions");
     EnsureConfigMenu(g_hGui);
 
-    // Create the Icon group + preview (positions set by LayoutMainGui)
-    g_hGrpIcon=CreateWindowW(
-        L"BUTTON",L"",
-        WS_CHILD|WS_VISIBLE|BS_GROUPBOX,
-        0,0,10,10,
-        g_hGui,(HMENU)IDC_GRP_ICON,g_hInst,nullptr
-    );
-    g_hLblIcon=CreateWindowW(
-        L"STATIC",L"Icon",
-        WS_CHILD|WS_VISIBLE|SS_LEFT|SS_NOPREFIX,
-        0,0,10,10,
-        g_hGui,(HMENU)IDC_LBL_ICON,g_hInst,nullptr
-    );
-    g_hIconPreview=CreateWindowW(
-        L"STATIC",L"",
-        WS_CHILD|WS_VISIBLE|SS_ICON,
-        0,0,10,10,
-        g_hGui,(HMENU)IDC_ICON_PREVIEW,g_hInst,nullptr
-    );
-    SendMessageW(g_hGrpIcon,WM_SETFONT,(WPARAM)g_hFont,TRUE);
-    SendMessageW(g_hLblIcon,WM_SETFONT,(WPARAM)g_hFont,TRUE);
-    SendMessageW(g_hIconPreview,WM_SETFONT,(WPARAM)g_hFont,TRUE);
+    // Icon preview box is custom-drawn.
     EnsureMenuTooltips(g_hGui);
+
+    if(g_hBtnGo){
+        LONG_PTR iStyle=GetWindowLongPtrW(g_hBtnGo,GWL_STYLE);
+        SetWindowLongPtrW(g_hBtnGo,GWL_STYLE,iStyle|BS_OWNERDRAW);
+        SetWindowSubclass(g_hBtnGo,ButtonHotSubclassProc,1,0);
+    }
+    if(g_hBtnTmpProf){
+        LONG_PTR iStyle=GetWindowLongPtrW(g_hBtnTmpProf,GWL_STYLE);
+        SetWindowLongPtrW(g_hBtnTmpProf,GWL_STYLE,iStyle|BS_OWNERDRAW);
+        SetWindowSubclass(g_hBtnTmpProf,ButtonHotSubclassProc,1,0);
+    }
+    if(g_hBtnConfig){
+        LONG_PTR iStyle=GetWindowLongPtrW(g_hBtnConfig,GWL_STYLE);
+        SetWindowLongPtrW(g_hBtnConfig,GWL_STYLE,iStyle|BS_OWNERDRAW);
+        SetWindowSubclass(g_hBtnConfig,ButtonHotSubclassProc,1,0);
+    }
+    if(g_hComboClient){
+        LONG_PTR iStyle=GetWindowLongPtrW(g_hComboClient,GWL_STYLE);
+        iStyle|=CBS_OWNERDRAWFIXED|CBS_HASSTRINGS;
+        SetWindowLongPtrW(g_hComboClient,GWL_STYLE,iStyle);
+        SetWindowPos(g_hComboClient,nullptr,0,0,0,0,
+                     SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECHANGED);
+        ApplyComboTheme(g_hComboClient);
+    }
 
     // Apply layout (also makes Go square + centered)
     LayoutMainGui(g_hGui);
@@ -772,6 +1699,8 @@ BOOL InitInstance(HINSTANCE hInstance,int nCmdShow){
     //}
     EnumChildWindows(g_hGui,[](HWND hwnd,LPARAM lParam)->BOOL{SendMessage(hwnd,WM_SETFONT,(WPARAM)lParam,TRUE);return TRUE;},(LPARAM)g_hFont);
     UpdateClientsComboBox();
+    LoadBakedThemesFromHeader();
+    ApplyTheme(g_iThemeMode,false);
     SetFocus(g_hComboClient);
     ShowWindow(g_hGui,nCmdShow);
     UpdateWindow(g_hGui);
@@ -901,6 +1830,8 @@ LRESULT CALLBACK WndProc(HWND hWnd,UINT message,WPARAM wParam,LPARAM lParam){
             GuiProfDel();
         } else if(wmId==IDM_CTX_EDIT_DEFAULT_PROFILE){
             GuiOpenDef();
+        } else if(wmId==IDM_CTX_THEME_COLOR){
+            ShowThemeDialog();
         } else if(wmId==IDM_ABOUT){
             ShowAboutDialog();
         } else{
@@ -913,12 +1844,59 @@ LRESULT CALLBACK WndProc(HWND hWnd,UINT message,WPARAM wParam,LPARAM lParam){
         }
         return 0;
     }
+    case WM_PAINT: {
+        PAINTSTRUCT ps{};
+        HDC hdc=BeginPaint(hWnd,&ps);
+        DrawIconPreviewBox(hdc);
+        EndPaint(hWnd,&ps);
+        return 0;
+    }
+    case WM_DRAWITEM: {
+        const DRAWITEMSTRUCT* vDraw=reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
+        if(vDraw) DrawOwnerDrawItem(*vDraw);
+        return TRUE;
+    }
+    case WM_MEASUREITEM: {
+        MEASUREITEMSTRUCT* vMeasure=reinterpret_cast<MEASUREITEMSTRUCT*>(lParam);
+        if(vMeasure){
+            if(vMeasure->CtlType==ODT_COMBOBOX){
+                vMeasure->itemHeight=(UINT)(g_iComboItemHeight>0?g_iComboItemHeight:ScaleByDpi(20,g_uiDpi));
+                return TRUE;
+            }
+            if(vMeasure->CtlType==ODT_MENU){
+                MeasureThemedMenuItem(*vMeasure);
+                return TRUE;
+            }
+        }
+        break;
+    }
+    case WM_CTLCOLORDLG:
     case WM_CTLCOLORBTN:
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORLISTBOX:
     case WM_CTLCOLORSTATIC: {
-        HDC hdcControl=(HDC)wParam;
-        SetTextColor(hdcControl,GetThemeSysColor(NULL,COLOR_BTNTEXT));
-        SetBkColor(hdcControl,GetThemeSysColor(NULL,COLOR_BTNFACE));
-        return (INT_PTR)GetThemeSysColorBrush(NULL,COLOR_BTNFACE);
+        return (INT_PTR)HandleThemeCtlColor(message,(HDC)wParam,(HWND)lParam);
+    }
+    case WM_ERASEBKGND: {
+        HDC hdc=(HDC)wParam;
+        RECT rc{};
+        GetClientRect(hWnd,&rc);
+        const int iSaved=SaveDC(hdc);
+        if(g_hIconPreview){
+            RECT rcIcon{};
+            GetWindowRect(g_hIconPreview,&rcIcon);
+            MapWindowPoints(nullptr,hWnd,(LPPOINT)&rcIcon,2);
+            ExcludeClipRect(hdc,rcIcon.left,rcIcon.top,rcIcon.right,rcIcon.bottom);
+        }
+        if(g_hLblIcon){
+            RECT rcLbl{};
+            GetWindowRect(g_hLblIcon,&rcLbl);
+            MapWindowPoints(nullptr,hWnd,(LPPOINT)&rcLbl,2);
+            ExcludeClipRect(hdc,rcLbl.left,rcLbl.top,rcLbl.right,rcLbl.bottom);
+        }
+        FillRect(hdc,&rc,g_hbrThemeWindow?g_hbrThemeWindow:(HBRUSH)GetSysColorBrush(COLOR_BTNFACE));
+        RestoreDC(hdc,iSaved);
+        return 1;
     }
     case WM_APP_PROGRESS_SHOW: {
         auto* p=reinterpret_cast<CtProgressPayload*>(lParam);
@@ -999,6 +1977,7 @@ LRESULT CALLBACK WndProc(HWND hWnd,UINT message,WPARAM wParam,LPARAM lParam){
             if(hbmp) DeleteObject(hbmp);
         }
         g_menuBitmaps.clear();
+        ClearMenuItemData();
         if(g_hConfigMenu){
             DestroyMenu(g_hConfigMenu);
             g_hConfigMenu=nullptr;
@@ -1032,6 +2011,11 @@ LRESULT CALLBACK WndProc(HWND hWnd,UINT message,WPARAM wParam,LPARAM lParam){
         }
         if(g_hFontAboutSmall){ DeleteObject(g_hFontAboutSmall); g_hFontAboutSmall=nullptr; }
         if(g_hFont) DeleteObject(g_hFont);
+        ClearThemeBrushes();
+        if(g_hIconColorLight){ DestroyIcon(g_hIconColorLight); g_hIconColorLight=nullptr; }
+        if(g_hIconColorDark){ DestroyIcon(g_hIconColorDark); g_hIconColorDark=nullptr; }
+        if(g_hBmpColorLight){ DeleteObject(g_hBmpColorLight); g_hBmpColorLight=nullptr; }
+        if(g_hBmpColorDark){ DeleteObject(g_hBmpColorDark); g_hBmpColorDark=nullptr; }
         PostQuitMessage(0);
         break;
     }
@@ -2487,6 +3471,7 @@ static INT_PTR CALLBACK AboutDlgProc(HWND hDlg,UINT msg,WPARAM wParam,LPARAM lPa
         },0);
 
         relayout(dpi,nullptr);
+        ApplyThemeToWindow(hDlg);
 
         return (INT_PTR)TRUE;
     }
@@ -2495,6 +3480,7 @@ static INT_PTR CALLBACK AboutDlgProc(HWND hDlg,UINT msg,WPARAM wParam,LPARAM lPa
         const UINT dpi=HIWORD(wParam);
         const RECT* rc=reinterpret_cast<RECT*>(lParam);
         relayout(dpi,rc);
+        ApplyThemeToWindow(hDlg);
         return (INT_PTR)TRUE;
     }
 
@@ -2528,6 +3514,218 @@ static INT_PTR CALLBACK AboutDlgProc(HWND hDlg,UINT msg,WPARAM wParam,LPARAM lPa
     return (INT_PTR)FALSE;
 }
 
+struct ThemeDlgState{
+    HWND hCombo=nullptr;
+    HWND hApply=nullptr;
+    HWND hCancel=nullptr;
+    int iInitialMode=0;
+    int iCurrentMode=0;
+    int iLastComboIndex=0;
+};
+
+static int ThemeComboIndexFromMode(int iMode){
+    if(iMode<0) return 0;
+    if(iMode<3) return iMode;
+    return g_iThemeSeparatorIndex+1+(iMode-3);
+}
+
+static int ThemeModeFromComboIndex(int iSel){
+    if(iSel<=2) return iSel;
+    return 3+(iSel-(g_iThemeSeparatorIndex+1));
+}
+
+static INT_PTR CALLBACK ThemeDlgProc(HWND hDlg,UINT msg,WPARAM wParam,LPARAM lParam){
+    auto relayout=[&](ThemeDlgState& aState,UINT iDpi){
+        const int iMargin=MulDiv(12,iDpi,96);
+        const int iGap=MulDiv(8,iDpi,96);
+        const int iComboH=MulDiv(24,iDpi,96);
+        const int iBtnW=MulDiv(84,iDpi,96);
+        const int iBtnH=MulDiv(28,iDpi,96);
+        const int iDlgW=MulDiv(360,iDpi,96);
+        const int iDlgH=MulDiv(140,iDpi,96);
+
+        RECT rcWnd{};
+        GetWindowRect(hDlg,&rcWnd);
+        SetWindowPos(hDlg,nullptr,rcWnd.left,rcWnd.top,iDlgW,iDlgH,SWP_NOZORDER|SWP_NOACTIVATE);
+
+        RECT rc{};
+        GetClientRect(hDlg,&rc);
+
+        const int iComboW=rc.right-iMargin*2;
+        const int iComboX=iMargin;
+        const int iComboY=iMargin;
+        MoveWindow(aState.hCombo,iComboX,iComboY,iComboW,iComboH,TRUE);
+
+        const int iBtnY=rc.bottom-iMargin-iBtnH;
+        const int iCancelX=rc.right-iMargin-iBtnW;
+        const int iApplyX=iCancelX-iGap-iBtnW;
+        MoveWindow(aState.hApply,iApplyX,iBtnY,iBtnW,iBtnH,TRUE);
+        MoveWindow(aState.hCancel,iCancelX,iBtnY,iBtnW,iBtnH,TRUE);
+
+        const int iItemHeight=(g_iComboItemHeight>0)?g_iComboItemHeight:MulDiv(20,iDpi,96);
+        SendMessageW(aState.hCombo,CB_SETITEMHEIGHT,(WPARAM)-1,iItemHeight);
+        SendMessageW(aState.hCombo,CB_SETITEMHEIGHT,0,iItemHeight);
+    };
+
+    ThemeDlgState* vState=reinterpret_cast<ThemeDlgState*>(GetWindowLongPtrW(hDlg,DWLP_USER));
+
+    switch(msg){
+    case WM_INITDIALOG: {
+        const UINT iDpi=GetDpiForWindow(hDlg);
+        auto* vStateNew=new ThemeDlgState{};
+        vStateNew->iInitialMode=g_iThemeMode;
+        vStateNew->iCurrentMode=g_iThemeMode;
+        SetWindowLongPtrW(hDlg,DWLP_USER,(LONG_PTR)vStateNew);
+        vState=vStateNew;
+
+        SetWindowTextW(hDlg,L"Color");
+
+        vState->hCombo=CreateWindowW(
+            L"COMBOBOX",L"",
+            WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|CBS_OWNERDRAWFIXED|CBS_HASSTRINGS|WS_VSCROLL|WS_TABSTOP,
+            0,0,10,10,
+            hDlg,(HMENU)IDC_THEME_COMBO,g_hInst,nullptr
+        );
+        g_hThemeCombo=vState->hCombo;
+        ApplyComboTheme(vState->hCombo);
+
+        SendMessageW(vState->hCombo,CB_ADDSTRING,0,(LPARAM)L"System (Auto)");
+        SendMessageW(vState->hCombo,CB_ADDSTRING,0,(LPARAM)L"System (Light, Default)");
+        SendMessageW(vState->hCombo,CB_ADDSTRING,0,(LPARAM)L"System (Dark)");
+        SendMessageW(vState->hCombo,CB_ADDSTRING,0,(LPARAM)L"----------");
+        for(const auto& theme:g_aCustomThemes){
+            SendMessageW(vState->hCombo,CB_ADDSTRING,0,(LPARAM)theme.name.c_str());
+        }
+
+        int iSel=ThemeComboIndexFromMode(vState->iCurrentMode);
+        const int iCount=(int)SendMessageW(vState->hCombo,CB_GETCOUNT,0,0);
+        if(iSel<0||iSel>=iCount) iSel=0;
+        vState->iLastComboIndex=iSel;
+        SendMessageW(vState->hCombo,CB_SETCURSEL,(WPARAM)iSel,0);
+
+        vState->hApply=CreateWindowW(
+            L"BUTTON",L"Apply",
+            WS_CHILD|WS_VISIBLE|BS_OWNERDRAW|WS_TABSTOP,
+            0,0,10,10,
+            hDlg,(HMENU)IDC_THEME_APPLY,g_hInst,nullptr
+        );
+        vState->hCancel=CreateWindowW(
+            L"BUTTON",L"Cancel",
+            WS_CHILD|WS_VISIBLE|BS_OWNERDRAW|WS_TABSTOP,
+            0,0,10,10,
+            hDlg,(HMENU)IDC_THEME_CANCEL,g_hInst,nullptr
+        );
+
+        if(g_hFont){
+            SendMessageW(vState->hCombo,WM_SETFONT,(WPARAM)g_hFont,TRUE);
+            SendMessageW(vState->hApply,WM_SETFONT,(WPARAM)g_hFont,TRUE);
+            SendMessageW(vState->hCancel,WM_SETFONT,(WPARAM)g_hFont,TRUE);
+        }
+
+        relayout(*vState,iDpi);
+        ApplyThemeToWindow(hDlg);
+        return (INT_PTR)TRUE;
+    }
+
+    case WM_DPICHANGED: {
+        const UINT iDpi=HIWORD(wParam);
+        const RECT* rc=reinterpret_cast<RECT*>(lParam);
+        if(rc){
+            SetWindowPos(hDlg,nullptr,rc->left,rc->top,rc->right-rc->left,rc->bottom-rc->top,SWP_NOZORDER|SWP_NOACTIVATE);
+        }
+        if(vState) relayout(*vState,iDpi);
+        return (INT_PTR)TRUE;
+    }
+
+    case WM_DRAWITEM: {
+        const DRAWITEMSTRUCT* vDraw=reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
+        if(vDraw) DrawOwnerDrawItem(*vDraw);
+        return (INT_PTR)TRUE;
+    }
+
+    case WM_MEASUREITEM: {
+        MEASUREITEMSTRUCT* vMeasure=reinterpret_cast<MEASUREITEMSTRUCT*>(lParam);
+        if(vMeasure&&vMeasure->CtlType==ODT_COMBOBOX){
+            const UINT iDpi=GetDpiForWindow(hDlg);
+            vMeasure->itemHeight=(UINT)((g_iComboItemHeight>0)?g_iComboItemHeight:MulDiv(20,iDpi,96));
+            return (INT_PTR)TRUE;
+        }
+        break;
+    }
+
+    case WM_CTLCOLORDLG:
+    case WM_CTLCOLORBTN:
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORLISTBOX:
+    case WM_CTLCOLORSTATIC:
+        return (INT_PTR)HandleThemeCtlColor(msg,(HDC)wParam,(HWND)lParam);
+
+    case WM_ERASEBKGND: {
+        HDC hdc=(HDC)wParam;
+        RECT rc{};
+        GetClientRect(hDlg,&rc);
+        FillRect(hdc,&rc,g_hbrThemeWindow?g_hbrThemeWindow:(HBRUSH)GetSysColorBrush(COLOR_BTNFACE));
+        return (INT_PTR)TRUE;
+    }
+
+    case WM_COMMAND: {
+        const int iId=LOWORD(wParam);
+        const int iEvent=HIWORD(wParam);
+        if(iId==IDC_THEME_COMBO&&iEvent==CBN_SELCHANGE){
+            const int iSel=(int)SendMessageW((HWND)lParam,CB_GETCURSEL,0,0);
+            if(vState){
+                if(iSel==g_iThemeSeparatorIndex){
+                    SendMessageW(vState->hCombo,CB_SETCURSEL,(WPARAM)vState->iLastComboIndex,0);
+                    return (INT_PTR)TRUE;
+                }
+                vState->iLastComboIndex=iSel;
+                const int iMode=ThemeModeFromComboIndex(iSel);
+                if(iMode>=3){
+                    const int iCustom=iMode-3;
+                    if(iCustom<0||iCustom>=(int)g_aCustomThemes.size()){
+                        return (INT_PTR)TRUE;
+                    }
+                }
+                vState->iCurrentMode=iMode;
+                ApplyTheme(vState->iCurrentMode,true);
+            }
+            return (INT_PTR)TRUE;
+        }
+        if(iId==IDC_THEME_APPLY){
+            if(vState){
+                ApplyTheme(vState->iCurrentMode,false);
+            }
+            EndDialog(hDlg,IDOK);
+            return (INT_PTR)TRUE;
+        }
+        if(iId==IDC_THEME_CANCEL||iId==IDCANCEL){
+            if(vState){
+                ApplyTheme(vState->iInitialMode,false);
+            }
+            EndDialog(hDlg,IDCANCEL);
+            return (INT_PTR)TRUE;
+        }
+        break;
+    }
+
+    case WM_CLOSE:
+        if(vState){
+            ApplyTheme(vState->iInitialMode,false);
+        }
+        EndDialog(hDlg,IDCANCEL);
+        return (INT_PTR)TRUE;
+
+    case WM_DESTROY:
+        if(vState){
+            delete vState;
+            SetWindowLongPtrW(hDlg,DWLP_USER,0);
+        }
+        g_hThemeCombo=nullptr;
+        break;
+    }
+    return (INT_PTR)FALSE;
+}
+
 
 static void ShowAboutDialog(){
     // Ensure the dialog is created under the same DPI awareness context as the main window.
@@ -2538,6 +3736,15 @@ static void ShowAboutDialog(){
 
     SetThreadDpiAwarenessContext(oldCtx);
     //DialogBoxW(g_hInst,MAKEINTRESOURCEW(IDD_ABOUTBOX),g_hGui,AboutDlgProc);
+}
+
+static void ShowThemeDialog(){
+    DPI_AWARENESS_CONTEXT vParentCtx=GetWindowDpiAwarenessContext(g_hGui);
+    DPI_AWARENESS_CONTEXT vOldCtx=SetThreadDpiAwarenessContext(vParentCtx);
+
+    DialogBoxW(g_hInst,MAKEINTRESOURCEW(IDD_THEME),g_hGui,ThemeDlgProc);
+
+    SetThreadDpiAwarenessContext(vOldCtx);
 }
 static HBITMAP IconToMenuBitmap(HICON hIcon,int cx,int cy){
     if(!hIcon) return nullptr;
@@ -2584,22 +3791,49 @@ static HICON LoadIconResScaled(int iconResId,int cx,int cy){
     );
 }
 
+static void ClearMenuItemData(){
+    for(auto& vItem:g_aMenuItemData){
+        if(vItem&&vItem->hIcon){
+            DestroyIcon(vItem->hIcon);
+            vItem->hIcon=nullptr;
+        }
+    }
+    g_aMenuItemData.clear();
+    g_iMenuIconPx=0;
+    g_iMenuMinWidth=0;
+}
 
-static void MenuAddItemBmp(HMENU hMenu,UINT id,const wchar_t* text,HBITMAP hbmp){
+static MenuItemData* AddMenuItemData(const wchar_t* text,HICON hIcon,bool separator){
+    auto vItem=std::make_unique<MenuItemData>();
+    if(text) vItem->text=text;
+    vItem->hIcon=hIcon;
+    vItem->separator=separator;
+    MenuItemData* ptr=vItem.get();
+    g_aMenuItemData.push_back(std::move(vItem));
+    return ptr;
+}
+
+
+static void MenuAddItemBmp(HMENU hMenu,UINT id,const wchar_t* text,HBITMAP hbmp,HICON hIcon){
+    MenuItemData* vData=AddMenuItemData(text,hIcon,false);
     MENUITEMINFOW mi{};
     mi.cbSize=sizeof(mi);
-    mi.fMask=MIIM_ID|MIIM_STRING|MIIM_BITMAP;
+    mi.fMask=MIIM_ID|MIIM_STRING|MIIM_BITMAP|MIIM_FTYPE|MIIM_DATA;
     mi.wID=id;
     mi.dwTypeData=const_cast<wchar_t*>(text);
     mi.hbmpItem=hbmp;
+    mi.fType=MFT_OWNERDRAW;
+    mi.dwItemData=(ULONG_PTR)vData;
     InsertMenuItemW(hMenu,(UINT)-1,TRUE,&mi);
 }
 
 static void MenuAddSep(HMENU hMenu){
+    MenuItemData* vData=AddMenuItemData(L"",nullptr,true);
     MENUITEMINFOW mi{};
     mi.cbSize=sizeof(mi);
-    mi.fMask=MIIM_FTYPE;
-    mi.fType=MFT_SEPARATOR;
+    mi.fMask=MIIM_FTYPE|MIIM_DATA;
+    mi.fType=MFT_OWNERDRAW|MFT_SEPARATOR;
+    mi.dwItemData=(ULONG_PTR)vData;
     InsertMenuItemW(hMenu,(UINT)-1,TRUE,&mi);
 }
 static void EnsureConfigMenu(HWND hWnd){
@@ -2608,34 +3842,83 @@ static void EnsureConfigMenu(HWND hWnd){
     g_hConfigMenu=CreatePopupMenu();
 
     const UINT dpi=GetDpiForWindow(hWnd);
+    PreloadThemeIcons(dpi);
 
     // pick a logical size you like for menu icons
     const int iconPx=MulDiv(28,dpi,96);      // <- change 18 to 16/20/24 etc.
+    g_iMenuIconPx=iconPx;
     //const int iconCx=GetSystemMetricsForDpi(SM_CXMENUCHECK,dpi);
     //const int iconCy=GetSystemMetricsForDpi(SM_CYMENUCHECK,dpi);
 
-    const int rowPad=MulDiv(2,dpi,96);
-
     MENUINFO mnuInfo{};
     mnuInfo.cbSize=sizeof(mnuInfo);
-    mnuInfo.fMask=MIM_STYLE;
+    mnuInfo.fMask=MIM_STYLE|MIM_BACKGROUND;
     mnuInfo.dwStyle=MNS_CHECKORBMP;
+    mnuInfo.hbrBack=g_hbrThemeMenu?g_hbrThemeMenu:GetSysColorBrush(COLOR_MENU);
     SetMenuInfo(g_hConfigMenu,&mnuInfo);
 
-    auto mkbmp=[&](int iconResId) -> HBITMAP{
-        HBITMAP b=LoadMenuBitmapFromIconRes(iconResId,dpi,iconPx,iconPx);
+    auto mkbmp=[&](HICON hIcon) -> HBITMAP{
+        HBITMAP b=IconToMenuBitmap(hIcon,iconPx,iconPx);
         g_menuBitmaps.push_back(b);
         return b;
     };
 
-    MenuAddItemBmp(g_hConfigMenu,IDM_CTX_SET_PROFILE_ICON,L"Set Profile Icon",mkbmp(IDI_AICOB));
-    MenuAddItemBmp(g_hConfigMenu,IDM_CTX_REFRESH_PROFILE,L"Refresh Profile",mkbmp(IDI_UPRFB));
-    MenuAddItemBmp(g_hConfigMenu,IDM_CTX_RESET_PROFILE,L"Reset Profile",mkbmp(IDI_RPRFB));
-    MenuAddItemBmp(g_hConfigMenu,IDM_CTX_DELETE_PROFILE,L"Delete Profile",mkbmp(IDI_DPRFB));
+    const int iIcoSet=g_bThemeIsDark?IDI_AICOW:IDI_AICOB;
+    const int iIcoRefresh=g_bThemeIsDark?IDI_UPRFW:IDI_UPRFB;
+    const int iIcoReset=g_bThemeIsDark?IDI_RPRFW:IDI_RPRFB;
+    const int iIcoDelete=g_bThemeIsDark?IDI_DPRFW:IDI_DPRFB;
+    const int iIcoEdit=g_bThemeIsDark?IDI_EDPFW:IDI_EDPFB;
+    const int iIcoAbout=g_bThemeIsDark?IDI_INFOW:IDI_INFOB;
+
+    // Precompute minimum menu width from text
+    g_iMenuMinWidth=0;
+    {
+        const wchar_t* aTexts[]={
+            L"Set Profile Icon",
+            L"Refresh Profile",
+            L"Reset Profile",
+            L"Delete Profile",
+            L"Edit Default profile",
+            L"Color",
+            L"About"
+        };
+        HDC hdc=GetDC(nullptr);
+        HFONT hOld=(HFONT)SelectObject(hdc,g_hFont?g_hFont:GetStockObject(DEFAULT_GUI_FONT));
+        SIZE sz{};
+        int iMaxText=0;
+        for(const auto* txt:aTexts){
+            if(!txt) continue;
+            GetTextExtentPoint32W(hdc,txt,(int)wcslen(txt),&sz);
+            iMaxText=max(iMaxText,sz.cx);
+        }
+        SelectObject(hdc,hOld);
+        ReleaseDC(nullptr,hdc);
+        const int iPad=MulDiv(6,dpi,96);
+        const int iIconPad=MulDiv(6,dpi,96);
+        g_iMenuMinWidth=iPad+iconPx+iIconPad+iMaxText+iPad+MulDiv(120,dpi,96);
+    }
+
+    auto addItem=[&](UINT id,const wchar_t* text,int iconResId){
+        HICON hIcon=LoadIconResBestDownscale(g_hInst,iconResId,iconPx,iconPx);
+        MenuAddItemBmp(g_hConfigMenu,id,text,mkbmp(hIcon),hIcon);
+    };
+
+    addItem(IDM_CTX_SET_PROFILE_ICON,L"Set Profile Icon",iIcoSet);
+    addItem(IDM_CTX_REFRESH_PROFILE,L"Refresh Profile",iIcoRefresh);
+    addItem(IDM_CTX_RESET_PROFILE,L"Reset Profile",iIcoReset);
+    addItem(IDM_CTX_DELETE_PROFILE,L"Delete Profile",iIcoDelete);
     MenuAddSep(g_hConfigMenu);
-    MenuAddItemBmp(g_hConfigMenu,IDM_CTX_EDIT_DEFAULT_PROFILE,L"Edit Default profile",mkbmp(IDI_EDPFB));
+    addItem(IDM_CTX_EDIT_DEFAULT_PROFILE,L"Edit Default profile",iIcoEdit);
     MenuAddSep(g_hConfigMenu);
-    MenuAddItemBmp(g_hConfigMenu,IDM_ABOUT,L"About",mkbmp(IDI_INFOB));
+    {
+        HICON hColor=nullptr;
+        if(g_bThemeIsDark&&g_hIconColorDark) hColor=CopyIcon(g_hIconColorDark);
+        if(!hColor&&g_hIconColorLight) hColor=CopyIcon(g_hIconColorLight);
+        if(!hColor) hColor=LoadIconResBestDownscale(g_hInst,g_bThemeIsDark?IDI_COLRW:IDI_COLRB,iconPx,iconPx);
+        MenuAddItemBmp(g_hConfigMenu,IDM_CTX_THEME_COLOR,L"Color",GetThemeColorMenuBitmap(),hColor);
+    }
+    MenuAddSep(g_hConfigMenu);
+    addItem(IDM_ABOUT,L"About",iIcoAbout);
 }
 
 
@@ -2687,13 +3970,6 @@ static void SetButtonIcon(HWND hBtn,int iconResId,HICON& hStore){
     SendMessageW(hBtn,BM_SETIMAGE,IMAGE_ICON,(LPARAM)hStore);
 }
 
-
-static HBITMAP LoadMenuBitmapFromIconRes(int iconResId,UINT /*dpi*/,int cx,int cy){
-    HICON hIcon=LoadIconResBestDownscale(g_hInst,iconResId,cx,cy);
-    HBITMAP hbmp=IconToMenuBitmap(hIcon,cx,cy);
-    if(hIcon) DestroyIcon(hIcon);
-    return hbmp;
-}
 
 static bool GetIconSizePx(HICON hIcon,int& w,int& h){
     w=h=0;
@@ -2895,9 +4171,9 @@ static fs::path GetProfileDirFromName(const std::wstring& name){
 }
 
 static void UpdateIconPreviewForSelection(bool preferListSelection){
-    if(!g_hIconPreview) return;
+    if(!g_hGui) return;
 
-    const UINT dpi=GetDpiForWindow(g_hIconPreview);
+    const UINT dpi=GetDpiForWindow(g_hGui);
     const int px=MulDiv(32,dpi,96);
 
     std::wstring name=GetSelectedClientNameSanitized(preferListSelection);
@@ -2911,13 +4187,14 @@ static void UpdateIconPreviewForSelection(bool preferListSelection){
         }
     }
     if(!hNew){
-        hNew=LoadIconResBestDownscale(g_hInst,IDI_NIMGB,px,px);
+        hNew=LoadIconResBestDownscale(g_hInst,g_bThemeIsDark?IDI_NIMGW:IDI_NIMGB,px,px);
     }
 
-    HICON hOld=(HICON)SendMessageW(g_hIconPreview,STM_SETIMAGE,IMAGE_ICON,(LPARAM)hNew);
-    if(hOld&&hOld!=hNew) DestroyIcon(hOld);
-
+    if(g_hIconPreviewHandle&&g_hIconPreviewHandle!=hNew){
+        DestroyIcon(g_hIconPreviewHandle);
+    }
     g_hIconPreviewHandle=hNew;
+    InvalidateRect(g_hGui,&g_rcIconBox,TRUE);
 }
 
 
@@ -2954,6 +4231,7 @@ static void EnsureMenuTooltips(HWND hWnd){
     g_menuTipText[IDM_CTX_RESET_PROFILE]=L"Delete this profile and recreate from Default.7z.";
     g_menuTipText[IDM_CTX_DELETE_PROFILE]=L"Permanently delete this profile folder.";
     g_menuTipText[IDM_CTX_EDIT_DEFAULT_PROFILE]=L"Open the Default profile for editing.";
+    g_menuTipText[IDM_CTX_THEME_COLOR]=L"Choose the UI color scheme.";
     g_menuTipText[IDM_ABOUT]=L"About ctSpaces";
 }
 
@@ -3021,6 +4299,7 @@ static void UpdateConfigMenuEnabledState(){
     en(IDM_CTX_DELETE_PROFILE,hasSelection);
 
     en(IDM_CTX_EDIT_DEFAULT_PROFILE,true);
+    en(IDM_CTX_THEME_COLOR,true);
     en(IDM_ABOUT,true);
 }
 static void LayoutMainGui(HWND hWnd){
@@ -3037,21 +4316,14 @@ static void LayoutMainGui(HWND hWnd){
 
     const int btnSmall=MulDiv(28,dpi,96);
 
-    // Icon target size (32 DIP)
+    // Icon preview box (48px at 100% DPI) and icon (32px at 100% DPI)
+    const int boxPx=MulDiv(48,dpi,96);
     const int iconPx=MulDiv(32,dpi,96);
-
-    // EXACT: 2px margin around icon inside groupbox
-    const int iconPad=MulDiv(6,dpi,96);
-
-    // Label: 4px from top-left, and -2px vertical (overlap border like a caption)
-    const int lblOffX=MulDiv(2,dpi,96);
-    const int lblOffY=MulDiv(1,dpi,96);
+    const int lblOffX=MulDiv(4,dpi,96);
+    const int lblOffY=MulDiv(2,dpi,96);
     const int lblH=MulDiv(14,dpi,96);
-    const int lblRise=MulDiv(2,dpi,96); // "Icon label should be -2px"
-
-    // Tight groupbox: label + pad + icon + pad
-    const int grpW=iconPx+iconPad*2;
-    const int grpH=(lblOffY+lblH+iconPad+iconPx+iconPad)-MulDiv(6,dpi,96);
+    const int grpW=boxPx;
+    const int grpH=boxPx;
 
     RECT rc{};
     GetClientRect(hWnd,&rc);
@@ -3083,21 +4355,7 @@ static void LayoutMainGui(HWND hWnd){
     const int yBtn=H-bm-btnSmall;
 
     const int grpX=bm;
-
-    MoveWindow(g_hGrpIcon,grpX,yRow,grpW,grpH,TRUE);
-
-    MoveWindow(
-        g_hLblIcon,
-        grpX+lblOffX,
-        yRow+lblOffY-lblRise,
-        grpW-lblOffX-iconPad-MulDiv(6,dpi,96),
-        lblH,
-        TRUE
-    );
-
-    const int xIco=grpX+iconPad;
-    const int yIco=yRow+lblOffY+lblH+iconPad-MulDiv(6,dpi,96);
-    MoveWindow(g_hIconPreview,xIco,yIco,iconPx,iconPx,TRUE);
+    g_rcIconBox={grpX,yRow,grpX+grpW,yRow+grpH};
 
     // Right buttons
     MoveWindow(g_hBtnTmpProf,xTmp,yBtn,btnSmall,btnSmall,TRUE);
@@ -3119,6 +4377,7 @@ static void LayoutMainGui(HWND hWnd){
     const int goY=y+comboVisH+m;//+MulDiv(8,dpi,96);
 
     MoveWindow(g_hBtnGo, goX, goY, goW, goH, TRUE);
+    InvalidateRect(hWnd,&g_rcIconBox,TRUE);
 }
 
 static std::wstring GetSelectedClientNameSanitized(bool preferListSelection){

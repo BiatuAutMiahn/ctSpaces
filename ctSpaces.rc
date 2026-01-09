@@ -48,6 +48,8 @@ IDI_INFOW               ICON                    "icons/info_w.ico"
 IDI_INFOB               ICON                    "icons/info_b.ico"
 IDI_NIMGW               ICON                    "icons/noimg_w.ico"
 IDI_NIMGB               ICON                    "icons/noimg_b.ico"
+IDI_COLRW               ICON                    "icons/color_w.ico"
+IDI_COLRB               ICON                    "icons/color_b.ico"
 IDI_IRND                ICON                    "icons/InfinityRND.ico"
 IDI_CTSPACES            ICON                    "icons/ctdkgrsq.ico"
 IDI_SMALL               ICON                    "icons/ctdkgrsq.ico"
@@ -94,9 +96,16 @@ CAPTION "About ctSpaces"
 FONT 8, "MS Shell Dlg", 0, 0, 0x1
 BEGIN
     ICON            IDI_CTSPACES,IDC_STATIC,14,14,21,20
-    LTEXT           "ctSpaces, Version 2.3",IDC_STATIC,42,14,114,8,SS_NOPREFIX
-    LTEXT           "Copyright InfinityResearchAndDevelopment(c) 2025",IDC_STATIC,42,26,114,8
+    LTEXT           "ctSpaces, Version 2.3pre6",IDC_STATIC,42,14,114,8,SS_NOPREFIX
+    LTEXT           "Copyright InfinityResearchAndDevelopment(c) 2026",IDC_STATIC,42,26,114,8
     DEFPUSHBUTTON   "OK",IDOK,113,41,50,14,WS_GROUP
+END
+
+IDD_THEME DIALOGEX 0, 0, 200, 80
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Color"
+FONT 8, "MS Shell Dlg", 0, 0, 0x1
+BEGIN
 END
 
 
@@ -164,8 +173,8 @@ IDR_DEFPROF             BINARY                  "Default.7z"
 //
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 2,3,0,0
- PRODUCTVERSION 2,3,0,0
+ FILEVERSION 2,3,6,0
+ PRODUCTVERSION 2,3,6,0
  FILEFLAGSMASK 0x3fL
 #ifdef _DEBUG
  FILEFLAGS 0x1L
@@ -182,12 +191,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "InfinityResearchAndDevelopment"
             VALUE "FileDescription", "Client Spaces for Corsica Technologies"
-            VALUE "FileVersion", "2.3.0.0"
+            VALUE "FileVersion", "2.3.6.0"
             VALUE "InternalName", "ctSpaces.exe"
-            VALUE "LegalCopyright", "Copyright InfinityResearchAndDevelopment(C) 2025"
+            VALUE "LegalCopyright", "Copyright InfinityResearchAndDevelopment(C) 2026"
             VALUE "OriginalFilename", "ctSpaces.exe"
             VALUE "ProductName", "ctSpaces"
-            VALUE "ProductVersion", "2.3.0.0"
+            VALUE "ProductVersion", "2.3.6.0"
         END
     END
     BLOCK "VarFileInfo"

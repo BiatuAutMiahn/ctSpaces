@@ -17,6 +17,7 @@ struct CtProgressPayload{
 };
 
 void ProgressUI_Init(HINSTANCE hInst);
+void ProgressUI_SetTheme(COLORREF crWindow,COLORREF crText,COLORREF crBar,COLORREF crBarBk,bool bDark);
 void ProgressUI_Show(HWND owner,const std::wstring& baseText,int percent);
 void ProgressUI_Update(int percent);          // uses last baseText
 void ProgressUI_Update(const std::wstring& baseText,int percent);

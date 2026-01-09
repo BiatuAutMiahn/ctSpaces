@@ -5,9 +5,20 @@
 #include <algorithm>
 #include <string>
 #include <uxtheme.h>
+#include <dwmapi.h>
 
 #pragma comment(lib, "UxTheme.lib")
 #pragma comment(lib, "Comctl32.lib")
+
+#ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
+#define DWMWA_USE_IMMERSIVE_DARK_MODE 20
+#endif
+#ifndef DWMWA_CAPTION_COLOR
+#define DWMWA_CAPTION_COLOR 35
+#endif
+#ifndef DWMWA_TEXT_COLOR
+#define DWMWA_TEXT_COLOR 36
+#endif
 
 static HINSTANCE g_hInst=nullptr;
 
@@ -19,6 +30,12 @@ static std::wstring g_baseText;
 static int  g_lastPercent=0;
 static bool g_marquee=false;
 static UINT g_dpi=USER_DEFAULT_SCREEN_DPI;
+static COLORREF g_crWindow=GetSysColor(COLOR_BTNFACE);
+static COLORREF g_crText=GetSysColor(COLOR_BTNTEXT);
+static COLORREF g_crBar=GetSysColor(COLOR_HIGHLIGHT);
+static COLORREF g_crBarBk=GetSysColor(COLOR_WINDOW);
+static HBRUSH g_hbrWindow=nullptr;
+static bool g_bDark=false;
 
 static const wchar_t* kProgClass=L"ctSpaces.ProgressUI";
 
@@ -28,6 +45,11 @@ static void RepositionInOwner(HWND owner,int desiredW,int desiredH);
 
 static int ScaleByDpi(int value,UINT dpi){
     return MulDiv(value,dpi,USER_DEFAULT_SCREEN_DPI);
+}
+
+static void UpdateProgressBrush(){
+    if(g_hbrWindow){ DeleteObject(g_hbrWindow); g_hbrWindow=nullptr; }
+    g_hbrWindow=CreateSolidBrush(g_crWindow);
 }
 
 static std::wstring ComposeCaption(const std::wstring& baseText,int percent){
@@ -48,7 +70,7 @@ static LRESULT CALLBACK ProgressWndProc(HWND hWnd,UINT msg,WPARAM wParam,LPARAM 
     {
         RECT rc{};
         GetClientRect(hWnd,&rc);
-        FillRect((HDC)wParam,&rc,GetSysColorBrush(COLOR_BTNFACE));
+        FillRect((HDC)wParam,&rc,g_hbrWindow?g_hbrWindow:GetSysColorBrush(COLOR_BTNFACE));
         return 1;
     }
 
@@ -59,7 +81,7 @@ static LRESULT CALLBACK ProgressWndProc(HWND hWnd,UINT msg,WPARAM wParam,LPARAM 
 
         RECT rc{};
         GetClientRect(hWnd,&rc);
-        FillRect(hdc,&rc,GetSysColorBrush(COLOR_BTNFACE));
+        FillRect(hdc,&rc,g_hbrWindow?g_hbrWindow:GetSysColorBrush(COLOR_BTNFACE));
 
         EndPaint(hWnd,&ps);
         return 0;
@@ -137,6 +159,10 @@ static void EnsureWindow(HWND owner){
         nullptr
     );
     g_dpi=GetDpiForWindow(g_hWnd);
+    BOOL bUseDark=g_bDark?TRUE:FALSE;
+    DwmSetWindowAttribute(g_hWnd,DWMWA_USE_IMMERSIVE_DARK_MODE,&bUseDark,sizeof(bUseDark));
+    DwmSetWindowAttribute(g_hWnd,DWMWA_CAPTION_COLOR,&g_crWindow,sizeof(g_crWindow));
+    DwmSetWindowAttribute(g_hWnd,DWMWA_TEXT_COLOR,&g_crText,sizeof(g_crText));
 
     // If you want to be extra sure there's no Close:
     // - Ensure no system menu
@@ -161,8 +187,8 @@ static void EnsureWindow(HWND owner){
     );
 
     SetWindowTheme(g_hBar,L"Explorer",nullptr);
-    SendMessageW(g_hBar,PBM_SETBKCOLOR,0,GetSysColor(COLOR_WINDOW));
-    SendMessageW(g_hBar,PBM_SETBARCOLOR,0,GetSysColor(COLOR_HIGHLIGHT));
+    SendMessageW(g_hBar,PBM_SETBKCOLOR,0,g_crBarBk);
+    SendMessageW(g_hBar,PBM_SETBARCOLOR,0,g_crBar);
     SendMessageW(g_hBar,PBM_SETRANGE,0,MAKELPARAM(0,100));
     SendMessageW(g_hBar,PBM_SETPOS,0,0);
 
@@ -246,6 +272,7 @@ static void SetMarquee(bool enable){
 
 void ProgressUI_Init(HINSTANCE hInst){
     g_hInst=hInst;
+    UpdateProgressBrush();
 }
 
 void ProgressUI_Show(HWND owner,const std::wstring& baseText,int percent){
@@ -325,4 +352,26 @@ void ProgressUI_PostUpdate(HWND mainWnd,const std::wstring& baseText,int percent
 
 void ProgressUI_PostHide(HWND mainWnd){
     PostMessageW(mainWnd,WM_APP_PROGRESS_HIDE,0,0);
+}
+
+void ProgressUI_SetTheme(COLORREF crWindow,COLORREF crText,COLORREF crBar,COLORREF crBarBk,bool bDark){
+    g_crWindow=crWindow;
+    g_crText=crText;
+    g_crBar=crBar;
+    g_crBarBk=crBarBk;
+    g_bDark=bDark;
+    UpdateProgressBrush();
+
+    if(g_hBar){
+        SendMessageW(g_hBar,PBM_SETBKCOLOR,0,g_crBarBk);
+        SendMessageW(g_hBar,PBM_SETBARCOLOR,0,g_crBar);
+    }
+
+    if(g_hWnd){
+        BOOL bUseDark=g_bDark?TRUE:FALSE;
+        DwmSetWindowAttribute(g_hWnd,DWMWA_USE_IMMERSIVE_DARK_MODE,&bUseDark,sizeof(bUseDark));
+        DwmSetWindowAttribute(g_hWnd,DWMWA_CAPTION_COLOR,&g_crWindow,sizeof(g_crWindow));
+        DwmSetWindowAttribute(g_hWnd,DWMWA_TEXT_COLOR,&g_crText,sizeof(g_crText));
+        InvalidateRect(g_hWnd,nullptr,TRUE);
+    }
 }
